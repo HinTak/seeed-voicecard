@@ -999,7 +999,7 @@ static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substre
 
 	/* spin_lock move to machine trigger */
 
-	if (y_start_n_stop && ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
+	if (ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
 		ac101_trigger(substream, cmd, dai);
 	}
 	if (y_start_n_stop && ac10x->sysclk_en == 0) {
@@ -1073,15 +1073,12 @@ static int ac108_trigger(struct snd_pcm_substream *substream, int cmd,
 			ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x0 << TXEN | 0x0 << GEN, ac10x);
 		}
 		spin_unlock_irqrestore(&ac10x->lock, flags);
-
-		/* delayed clock starting, move to machine trigger() */
+		ac108_set_clock(1, substream, cmd, dai);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		if (ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
-			ac101_trigger(substream, cmd, dai);
-		}
+		ac108_set_clock(0, substream, cmd, dai);
 		break;
 	default:
 		ret = -EINVAL;

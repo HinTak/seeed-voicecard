@@ -1280,11 +1280,13 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 			ret = ret || ac101_update_bits(codec, MOD_RST_CTRL, (0x1<<MOD_RESET_AIF1), (0x1<<MOD_RESET_AIF1));
 		}
 		spin_unlock_irqrestore(&ac10x->lock, flags);
+		ac101_set_clock(1, substream, cmd, dai);
 		#endif
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		ac101_set_clock(0, NULL, 0, NULL);
 		break;
 	default:
 		ret = -EINVAL;
