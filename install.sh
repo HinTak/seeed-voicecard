@@ -188,9 +188,11 @@ sed -i -e 's:#dtparam=i2c_arm=on:dtparam=i2c_arm=on:g'  $CONFIG || true
 grep -q "^dtoverlay=i2s-mmap$" $CONFIG || \
   echo "dtoverlay=i2s-mmap" >> $CONFIG
 
-
 grep -q "^dtparam=i2s=on$" $CONFIG || \
   echo "dtparam=i2s=on" >> $CONFIG
+
+grep -q "^dtoverlay=seeed-2mic-voicecard$" $CONFIG || \
+  echo "dtoverlay=seeed-2mic-voicecard" >> $CONFIG
 
 #install config files
 mkdir /etc/voicecard || true
