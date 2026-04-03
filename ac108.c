@@ -446,10 +446,13 @@ static const struct snd_soc_dapm_route ac108_dapm_routes[] = {
 
 static int ac108_multi_write(u8 reg, u8 val, struct ac10x_priv *ac10x) {
 	u8 i;
+	int ret = 0;
 	for (i = 0; i < ac10x->codec_cnt; i++) {
-		ac10x_write(reg, val, ac10x->i2cmap[i]);
+		int r = ac10x_write(reg, val, ac10x->i2cmap[i]);
+		if (r < 0)
+			ret = r;
 	}
-	return 0;
+	return ret;
 }
 
 static int ac108_multi_update_bits(u8 reg, u8 mask, u8 val, struct ac10x_priv *ac10x) {

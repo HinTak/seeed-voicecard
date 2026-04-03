@@ -122,6 +122,11 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_override;
 
+	/* Drain any pending clock-stop work before starting a new stream.
+	 * cancel_work_sync sleeps, so it must not run under the stream lock;
+	 * the startup callback runs in process context with no spinlock held. */
+	cancel_work_sync(&priv->work_codec_clk);
+
 	return ret;
 }
 
@@ -131,6 +136,11 @@ static void seeed_voice_card_shutdown(struct snd_pcm_substream *substream)
 	struct seeed_card_data *priv =	snd_soc_card_get_drvdata(rtd->card);
 	struct seeed_dai_props *dai_props =
 		seeed_priv_to_props(priv, rtd->num);
+
+	/* Drain deferred clock-stop work before shutdown tears down the codec.
+	 * Without this, ac108_aif_shutdown can race with the workqueue item
+	 * over I2C register writes. Safe here: shutdown runs in process context. */
+	cancel_work_sync(&priv->work_codec_clk);
 
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_default;
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_default;
@@ -208,6 +218,25 @@ static void work_cb_codec_clk(struct work_struct *work)
 	return;
 }
 
+/* prepare: enable codec clocks in process context (outside the stream lock).
+ * The _set_clock functions perform I2C writes that sleep, so they must not
+ * run in the atomic trigger callback.  ac108_set_clock guards on sysclk_en,
+ * so repeated prepare calls are harmless no-ops. */
+static int seeed_voice_card_prepare(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_dai *dai = snd_soc_rtd_to_codec(rtd, 0);
+
+	if (_set_clock[SNDRV_PCM_STREAM_CAPTURE])
+		_set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream,
+			SNDRV_PCM_TRIGGER_START, dai);
+	if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK])
+		_set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, substream,
+			SNDRV_PCM_TRIGGER_START, dai);
+
+	return 0;
+}
+
 static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
@@ -226,16 +255,7 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		if (cancel_work_sync(&priv->work_codec_clk) != 0) {}
-		#if CONFIG_AC10X_TRIG_LOCK
-		/* I know it will degrades performance, but I have no choice */
-		spin_lock_irqsave(&priv->lock, flags);
-		#endif
-		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
-		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, substream, cmd, dai);
-		#if CONFIG_AC10X_TRIG_LOCK
-		spin_unlock_irqrestore(&priv->lock, flags);
-		#endif
+		/* Clock enable moved to seeed_voice_card_prepare (process ctx) */
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -246,15 +266,12 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 			break;
 		}
 
-		/* interrupt environment */
-		if (in_irq() || in_nmi() || in_serving_softirq()) {
-			priv->try_stop = 0;
-			if (0 != schedule_work(&priv->work_codec_clk)) {
-			}
-		} else {
-			if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-			if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-		}
+		/* Always defer clock-stop to the workqueue.  ALSA trigger
+		 * callbacks run under snd_pcm_stream_lock_irq (atomic context)
+		 * regardless of caller.  The _set_clock functions perform I2C
+		 * writes that sleep, so they must never run here directly. */
+		priv->try_stop = 0;
+		schedule_work(&priv->work_codec_clk);
 		break;
 	default:
 		ret = -EINVAL;
@@ -271,6 +288,7 @@ static struct snd_soc_ops seeed_voice_card_ops = {
 	.startup = seeed_voice_card_startup,
 	.shutdown = seeed_voice_card_shutdown,
 	.hw_params = seeed_voice_card_hw_params,
+	.prepare = seeed_voice_card_prepare,
 	.trigger = seeed_voice_card_trigger,
 };
 
