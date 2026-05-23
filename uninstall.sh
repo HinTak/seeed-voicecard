@@ -14,6 +14,9 @@ fi
 uname_r=$(uname -r)
 
 CONFIG=/boot/config.txt
+[ -f /boot/firmware/config.txt ] && CONFIG=/boot/firmware/config.txt
+[ -f /boot/firmware/usercfg.txt ] && CONFIG=/boot/firmware/usercfg.txt
+
 get_overlay() {
     ov=$1
     if grep -q -E "^dtoverlay=$ov" $CONFIG; then
@@ -51,19 +54,24 @@ do_overlay() {
 
 RPI_HATS="seeed-2mic-voicecard seeed-4mic-voicecard seeed-8mic-voicecard"
 
+PATH=$PATH:/opt/vc/bin
 echo "remove dtbos"
 for i in $RPI_HATS; do
     dtoverlay -r $i
 done
-rm  /boot/overlays/seeed-2mic-voicecard.dtbo || true
-rm  /boot/overlays/seeed-4mic-voicecard.dtbo || true
-rm  /boot/overlays/seeed-8mic-voicecard.dtbo || true
+OVERLAYS=/boot/overlays
+[ -d /boot/firmware/overlays ] && OVERLAYS=/boot/firmware/overlays
+
+rm  ${OVERLAYS}/seeed-2mic-voicecard.dtbo || true
+rm  ${OVERLAYS}/seeed-4mic-voicecard.dtbo || true
+rm  ${OVERLAYS}/seeed-8mic-voicecard.dtbo || true
 
 echo "remove alsa configs"
 rm -rf  /etc/voicecard/ || true
 
 echo "disabled seeed-voicecard.service "
-systemctl disable seeed-voicecard.service 
+systemctl stop seeed-voicecard.service
+systemctl disable seeed-voicecard.service
 
 echo "remove seeed-voicecard"
 rm  /usr/bin/seeed-voicecard || true
@@ -76,6 +84,9 @@ echo "remove kernel modules"
 rm  /lib/modules/*/kernel/sound/soc/codecs/snd-soc-wm8960.ko || true
 rm  /lib/modules/*/kernel/sound/soc/codecs/snd-soc-ac108.ko || true
 rm  /lib/modules/*/kernel/sound/soc/bcm/snd-soc-seeed-voicecard.ko || true
+rm  /lib/modules/*/updates/dkms/snd-soc-wm8960.ko || true
+rm  /lib/modules/*/updates/dkms/snd-soc-ac108.ko || true
+rm  /lib/modules/*/updates/dkms/snd-soc-seeed-voicecard.ko || true
 
 echo "remove $CONFIG configuration"
 for i in $RPI_HATS; do

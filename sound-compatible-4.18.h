@@ -9,7 +9,7 @@
 
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,18,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 #define __NO_SND_SOC_CODEC_DRV     1
 #else
 #define __NO_SND_SOC_CODEC_DRV     0
@@ -31,8 +31,12 @@
 #define snd_soc_codec_get_dapm     snd_soc_component_get_dapm
 #define snd_soc_codec_get_bias_level snd_soc_component_get_bias_level
 #define snd_soc_kcontrol_codec     snd_soc_kcontrol_component
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
+#define snd_soc_read               snd_soc_component_read
+#else
 #define snd_soc_read               snd_soc_component_read32
-#define snd_soc_register_codec     snd_soc_register_component
+#endif
+#define snd_soc_register_codec     devm_snd_soc_register_component
 #define snd_soc_unregister_codec   snd_soc_unregister_component
 #define snd_soc_update_bits        snd_soc_component_update_bits
 #define snd_soc_write              snd_soc_component_write

@@ -376,7 +376,7 @@ static int ac101_switch_probe(struct ac10x_priv *ac10x) {
 
 	ac10x->irq = gpiod_to_irq(ac10x->gpiod_irq);
 	if (IS_ERR_VALUE(ac10x->irq)) {
-		pr_info("[ac101] map gpio to irq failed, errno = %ld\n", ac10x->irq);
+		pr_warn("[ac101] map gpio to irq failed, errno = %ld\n", ac10x->irq);
 		ac10x->irq = 0;
 		goto _err_irq;
 	}
@@ -384,7 +384,7 @@ static int ac101_switch_probe(struct ac10x_priv *ac10x) {
 	/* request irq, set irq type to falling edge trigger */
 	ret = devm_request_irq(ac10x->codec->dev, ac10x->irq, audio_hmic_irq, IRQF_TRIGGER_FALLING, "SWTICH_EINT", ac10x);
 	if (IS_ERR_VALUE(ret)) {
-		pr_info("[ac101] request virq %ld failed, errno = %ld\n", ac10x->irq, ret);
+		pr_warn("[ac101] request virq %ld failed, errno = %ld\n", ac10x->irq, ret);
 		goto _err_irq;
 	}
 
@@ -782,8 +782,8 @@ static struct snd_kcontrol_new ac101_controls[] = {
 	SOC_DOUBLE_TLV("DAC volume", DAC_VOL_CTRL, DAC_VOL_L, DAC_VOL_R, 0xff, 0, dac_vol_tlv),
 	SOC_DOUBLE_TLV("DAC mixer gain", DAC_MXR_GAIN, DACL_MXR_GAIN, DACR_MXR_GAIN, 0xf, 0, dac_mix_vol_tlv),
 	SOC_SINGLE_TLV("digital volume", DAC_DBG_CTRL, DVC, 0x3f, 1, dig_vol_tlv),
-	SOC_SINGLE_TLV("speaker volume", SPKOUT_CTRL, SPK_VOL, 0x1f, 0, speaker_vol_tlv),
-	SOC_SINGLE_TLV("headphone volume", HPOUT_CTRL, HP_VOL, 0x3f, 0, headphone_vol_tlv),
+	SOC_SINGLE_TLV("Speaker Playback Volume", SPKOUT_CTRL, SPK_VOL, 0x1f, 0, speaker_vol_tlv),
+	SOC_SINGLE_TLV("Headphone Playback Volume", HPOUT_CTRL, HP_VOL, 0x3f, 0, headphone_vol_tlv),
 };
 
 /* PLL divisors */
@@ -955,10 +955,10 @@ void ac101_aif_shutdown(struct snd_pcm_substream *substream, struct snd_soc_dai 
 
 	AC101_DBG("stream = %s, play: %d, capt: %d, active: %d\n", 
 		snd_pcm_stream_str(substream),
-		codec_dai->playback_active, codec_dai->capture_active,
-		codec_dai->active);
+		codec_dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active, codec_dai->stream[SNDRV_PCM_STREAM_CAPTURE].active,
+		snd_soc_dai_active(codec_dai));
 
-	if (!codec_dai->active) {
+	if (!snd_soc_dai_active(codec_dai)) {
 		ac10x->aif1_clken = 1;
 		ac101_aif1clk(codec, SND_SOC_DAPM_POST_PMD, 0);
 	} else {
@@ -1080,7 +1080,7 @@ int ac101_hw_params(struct snd_pcm_substream *substream,
 	freq_out = _FREQ_24_576K;
 	for (i = 0; i < ARRAY_SIZE(codec_aif1_fs); i++) {
 		if (codec_aif1_fs[i].samp_rate == params_rate(params)) {
-			if (codec_dai->capture_active && dmic_used && codec_aif1_fs[i].samp_rate == 44100) {
+			if (codec_dai->stream[SNDRV_PCM_STREAM_CAPTURE].active && dmic_used && codec_aif1_fs[i].samp_rate == 44100) {
 				ac101_update_bits(codec, AIF_SR_CTRL, (0xf<<AIF1_FS), (0x4<<AIF1_FS));
 			} else {
 				ac101_update_bits(codec, AIF_SR_CTRL, (0xf<<AIF1_FS), ((codec_aif1_fs[i].srbit)<<AIF1_FS));
@@ -1152,14 +1152,14 @@ int ac101_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	switch(fmt & SND_SOC_DAIFMT_MASTER_MASK) {
 	case SND_SOC_DAIFMT_CBM_CFM:   /* codec clk & frm master, ap is slave*/
 		#if _MASTER_MULTI_CODEC == _MASTER_AC101
-		pr_warn("AC101 as Master\n");
+		pr_info("AC101 as Master\n");
 		reg_val |= (0x0<<AIF1_MSTR_MOD);
 		break;
 		#else
-		pr_warn("AC108 as Master\n");
+		pr_info("AC108 as Master\n");
 		#endif
 	case SND_SOC_DAIFMT_CBS_CFS:   /* codec clk & frm slave, ap is master*/
-		pr_warn("AC101 as Slave\n");
+		pr_info("AC101 as Slave\n");
 		reg_val |= (0x1<<AIF1_MSTR_MOD);
 		break;
 	default:
@@ -1237,7 +1237,7 @@ int ac101_audio_startup(struct snd_pcm_substream *substream,
 }
 
 #if _MASTER_MULTI_CODEC == _MASTER_AC101
-static int ac101_set_clock(int y_start_n_stop) {
+static int ac101_set_clock(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai) {
 	int r;
 
 	if (y_start_n_stop) {
@@ -1258,6 +1258,7 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct snd_soc_codec *codec = dai->codec;
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
 	int ret = 0;
+	unsigned long flags;
 
 	AC101_DBG("stream=%s  cmd=%d\n",
 		snd_pcm_stream_str(substream),
@@ -1268,6 +1269,7 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		#if _MASTER_MULTI_CODEC == _MASTER_AC101
+		spin_lock_irqsave(&ac10x->lock, flags);
 		if (ac10x->aif1_clken == 0){
 			/*
 			 * enable aif1clk, it' here due to reduce time between 'AC108 Sysclk Enable' and 'AC101 Sysclk Enable'
@@ -1277,6 +1279,7 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 			ret = ret || ac101_update_bits(codec, MOD_CLK_ENA, (0x1<<MOD_CLK_AIF1), (0x1<<MOD_CLK_AIF1));
 			ret = ret || ac101_update_bits(codec, MOD_RST_CTRL, (0x1<<MOD_RESET_AIF1), (0x1<<MOD_RESET_AIF1));
 		}
+		spin_unlock_irqrestore(&ac10x->lock, flags);
 		#endif
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -1286,6 +1289,9 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 	default:
 		ret = -EINVAL;
 	}
+	AC101_DBG("stream=%s  cmd=%d;finished %d\n",
+		snd_pcm_stream_str(substream),
+		cmd, ret);
 	return ret;
 }
 

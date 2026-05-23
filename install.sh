@@ -1,14 +1,11 @@
 #!/bin/bash
 
-#FORCE_KERNEL="1.20190925+1-1"
-FORCE_KERNEL="1.20200601-1"
-
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root (use sudo)" 1>&2
    exit 1
 fi
 
-# Check if enough space on /boot volume
+# Check for enough space on /boot volume
 boot_line=$(df -h | grep /boot | head -n 1)
 if [ "x${boot_line}" = "x" ]; then
   echo "Warning: /boot volume not found .."
@@ -29,19 +26,24 @@ fi
 
 #
 # make sure that we are on something ARM/Raspberry related
-# either a bare metal Raspberry or a qemu session with 
+# either a bare metal Raspberry or a qemu session with
 # Raspberry stuff available
 # - check for /boot/overlays
 # - dtparam and dtoverlay is available
 errorFound=0
-if [ ! -d /boot/overlays ] ; then
-  echo "/boot/overlays not found or not a directory" 1>&2
+OVERLAYS=/boot/overlays
+[ -d /boot/firmware/overlays ] && OVERLAYS=/boot/firmware/overlays
+
+if [ ! -d $OVERLAYS ] ; then
+  echo "$OVERLAYS not found or not a directory" 1>&2
   errorFound=1
 fi
 # should we also check for alsactl and amixer used in seeed-voicecard?
+PATH=$PATH:/opt/vc/bin
 for cmd in dtparam dtoverlay ; do
   if ! which $cmd &>/dev/null ; then
     echo "$cmd not found" 1>&2
+    echo "You may need to run ./ubuntu-prerequisite.sh"
     errorFound=1
   fi
 done
@@ -64,8 +66,13 @@ function get_kernel_version() {
   _VER_RUN=""
   [ -z "$_VER_RUN" ] && {
     ZIMAGE=/boot/kernel.img
+    [ -f /boot/firmware/vmlinuz ] && ZIMAGE=/boot/firmware/vmlinuz
+    # 64-bit-only kernel package
+    [ ! -f /boot/kernel.img ] && [ -f /boot/kernel8.img ] && ZIMAGE=/boot/kernel8.img
+    # Raspberry Pi 5 (bcm2712) ships kernel_2712.img alongside kernel8.img
+    [ -f /boot/firmware/kernel_2712.img ] && ZIMAGE=/boot/firmware/kernel_2712.img
     IMG_OFFSET=$(LC_ALL=C grep -abo $'\x1f\x8b\x08\x00' $ZIMAGE | head -n 1 | cut -d ':' -f 1)
-    _VER_RUN=$(dd if=$ZIMAGE obs=64K ibs=4 skip=$(( IMG_OFFSET / 4)) | zcat | grep -a -m1 "Linux version" | strings | awk '{ print $3; }')
+    _VER_RUN=$(dd if=$ZIMAGE obs=64K ibs=4 skip=$(( IMG_OFFSET / 4)) 2>/dev/null | zcat | grep -a -m1 "Linux version" | LC_ALL=C sed -e 's/^.*Linux/Linux/' | strings | awk '{ print $3; }')
   }
   echo "$_VER_RUN"
   return 0
@@ -73,17 +80,24 @@ function get_kernel_version() {
 
 function check_kernel_headers() {
   VER_RUN=$(get_kernel_version)
-  VER_HDR=$(dpkg -L raspberrypi-kernel-headers | egrep -m1 "/lib/modules/[^-]+/build" | awk -F'/' '{ print $4; }')
+  # Headers may live under /lib/modules/<ver>/build (older layouts) or
+  # /usr/lib/modules/<ver>/build (Debian Trixie / usrmerge). Extract <ver>
+  # via sed so the prefix doesn't matter.
+  VER_HDR=$(dpkg -L raspberrypi-kernel-headers 2>/dev/null | sed -nE 's|^.*/lib/modules/([^/]+)/build$|\1|p' | head -n1)
+  [ "X$VER_RUN" == "X$VER_HDR" ] && {
+    return 0
+  }
+  VER_HDR=$(dpkg -L linux-headers-$VER_RUN 2>/dev/null | sed -nE 's|^.*/lib/modules/([^/]+)/build$|\1|p' | head -n1)
   [ "X$VER_RUN" == "X$VER_HDR" ] && {
     return 0
   }
 
   # echo RUN=$VER_RUN HDR=$VER_HDR
   echo " !!! Your kernel version is $VER_RUN"
-  echo "     Couldn't find *** corresponding *** kernel headers with apt-get."
-  echo "     This may happen if you ran 'rpi-update'."
-  echo " Choose  *** y *** to revert the kernel to version $VER_HDR and continue."
-  echo " Choose  *** N *** to exit without this driver support, by default."
+  echo "     Not found *** corresponding *** kernel headers with apt-get."
+  echo "     This may occur if you have ran 'rpi-update'."
+  echo " Choose  *** y *** will revert the kernel to version $VER_HDR then continue."
+  echo " Choose  *** N *** will exit without this driver support, by default."
   read -p "Would you like to proceed? (y/N)" -n 1 -r -s
   echo
   if ! [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -93,51 +107,19 @@ function check_kernel_headers() {
   apt-get -y --reinstall install raspberrypi-kernel
 }
 
-function download_install_debpkg() {
-  local prefix name r
-  prefix=$1
-  name=$2
-
-  for (( i = 0; i < 3; i++ )); do
-    wget $prefix$name -O /tmp/$name && break
-  done
-  dpkg -i /tmp/$name; r=$?
-  rm -f /tmp/$name
-  return $r
-}
-
-option_pattern="compat-kernel"
-if [[ $1 =~ ${option_pattern} ]]; then
-  echo "will compile with a compatible kernel..."
-else
-  FORCE_KERNEL=""
-  echo "will compile with the latest kernel..."
-fi
-
-function install_kernel() {
-  local _url _prefix
-
-  # Instead of retrieving the lastest kernel & headers
-  [ "X$FORCE_KERNEL" == "X" ] && {
-    apt-get -y --force-yes install raspberrypi-kernel-headers raspberrypi-kernel
-  } || {
-    # We would like to a fixed version
-    KERN_NAME=raspberrypi-kernel_${FORCE_KERNEL}_armhf.deb
-    HDR_NAME=raspberrypi-kernel-headers_${FORCE_KERNEL}_armhf.deb
-    _url=$(apt-get download --print-uris raspberrypi-kernel | sed -nre "s/'([^']+)'.*$/\1/g;p")
-    _prefix=$(echo $_url | sed -nre 's/^(.*)raspberrypi-kernel_.*$/\1/g;p')
-
-    download_install_debpkg "$_prefix" "$KERN_NAME"
-    download_install_debpkg "$_prefix" "$HDR_NAME"
-  }
-}
-
 # update and install required packages
 which apt &>/dev/null
 if [[ $? -eq 0 ]]; then
   apt update -y
+  # Raspbian/legacy kernel packages (absent on Debian Trixie+; ignore failure)
+  apt-get -y install raspberrypi-kernel-headers raspberrypi-kernel || true
+  # Debian Trixie / Raspberry Pi OS Bookworm+ kernel packages
+  apt-get -y install "linux-headers-$(uname -r)" || true
+  # Recent Raspbian has 64-bit kernel on 32-bit userspace
+  apt-get -y install gcc-aarch64-linux-gnu || true
+  # Ubuntu kernel packages
+  apt-get -y install linux-raspi linux-headers-raspi linux-image-raspi || true
   apt-get -y install dkms git i2c-tools libasound2-plugins
-  install_kernel
   # rpi-update checker
   check_kernel_headers
 fi
@@ -152,7 +134,8 @@ fi
 # it's just been updated)
 base_ver=$(get_kernel_version)
 base_ver=${base_ver%%[-+]*}
-kernels="${base_ver}+ ${base_ver}-v7+ ${base_ver}-v7l+"
+#kernels="${base_ver}+ ${base_ver}-v7+ ${base_ver}-v7l+"
+kernels=$(uname -r)
 
 function install_module {
   local _i
@@ -176,10 +159,6 @@ function install_module {
   for _i in $kernels; do
     dkms build -k $_i -m $mod -v $ver && {
       dkms install --force -k $_i -m $mod -v $ver
-    } || {
-      echo "Can't compile with this kernel, aborting"
-      echo "Please try to compile with the option --compat-kernel"
-      exit 1
     }
   done
 
@@ -190,12 +169,12 @@ install_module "./" "seeed-voicecard"
 
 
 # install dtbos
-cp seeed-2mic-voicecard.dtbo /boot/overlays
-cp seeed-4mic-voicecard.dtbo /boot/overlays
-cp seeed-8mic-voicecard.dtbo /boot/overlays
+cp seeed-2mic-voicecard.dtbo $OVERLAYS
+cp seeed-4mic-voicecard.dtbo $OVERLAYS
+cp seeed-8mic-voicecard.dtbo $OVERLAYS
 
-# install alsa plugins
-# we don't need this plugin now
+#install alsa plugins
+# no need this plugin now
 # install -D ac108_plugin/libasound_module_pcm_ac108.so /usr/lib/arm-linux-gnueabihf/alsa-lib/
 rm -f /usr/lib/arm-linux-gnueabihf/alsa-lib/libasound_module_pcm_ac108.so
 
@@ -205,16 +184,24 @@ grep -q "^snd-soc-seeed-voicecard$" /etc/modules || \
 grep -q "^snd-soc-ac108$" /etc/modules || \
   echo "snd-soc-ac108" >> /etc/modules
 grep -q "^snd-soc-wm8960$" /etc/modules || \
-  echo "snd-soc-wm8960" >> /etc/modules  
+  echo "snd-soc-wm8960" >> /etc/modules
 
 #set dtoverlays
-sed -i -e 's:#dtparam=i2c_arm=on:dtparam=i2c_arm=on:g'  /boot/config.txt || true
-grep -q "^dtoverlay=i2s-mmap$" /boot/config.txt || \
-  echo "dtoverlay=i2s-mmap" >> /boot/config.txt
+CONFIG=/boot/config.txt
+[ -f /boot/firmware/config.txt ] && CONFIG=/boot/firmware/config.txt
+[ -f /boot/firmware/usercfg.txt ] && CONFIG=/boot/firmware/usercfg.txt
+
+sed -i -e 's:#dtparam=i2c_arm=on:dtparam=i2c_arm=on:g'  $CONFIG || true
+# i2s-mmap was removed from recent Raspberry Pi firmware (mmap support is
+# now native in the I2S driver); only enable it if the overlay still ships.
+if [ -f "$OVERLAYS/i2s-mmap.dtbo" ]; then
+  grep -q "^dtoverlay=i2s-mmap$" $CONFIG || \
+    echo "dtoverlay=i2s-mmap" >> $CONFIG
+fi
 
 
-grep -q "^dtparam=i2s=on$" /boot/config.txt || \
-  echo "dtparam=i2s=on" >> /boot/config.txt
+grep -q "^dtparam=i2s=on$" $CONFIG || \
+  echo "dtparam=i2s=on" >> $CONFIG
 
 #install config files
 mkdir /etc/voicecard || true
@@ -238,10 +225,10 @@ git --git-dir=/etc/voicecard/.git --work-tree=/etc/voicecard/ commit  -m "origin
 
 cp seeed-voicecard /usr/bin/
 cp seeed-voicecard.service /lib/systemd/system/
-systemctl enable  seeed-voicecard.service 
+systemctl enable  seeed-voicecard.service
 systemctl start   seeed-voicecard
 
 echo "------------------------------------------------------"
-echo "Please reboot your device to apply all settings"
+echo "Please reboot your raspberry pi to apply all settings"
 echo "Enjoy!"
 echo "------------------------------------------------------"

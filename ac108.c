@@ -653,7 +653,7 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 
 	dev_dbg(dai->dev, "%s() stream=%s play:%d capt:%d +++\n", __func__,
 			snd_pcm_stream_str(substream),
-			dai->playback_active, dai->capture_active);
+			dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active, dai->stream[SNDRV_PCM_STREAM_CAPTURE].active);
 
 	if (ac10x->i2c101) {
 		ret = ac101_hw_params(substream, params, dai);
@@ -664,8 +664,8 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 		}
 	}
 
-	if ((substream->stream == SNDRV_PCM_STREAM_CAPTURE && dai->playback_active)
-	 || (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && dai->capture_active)) {
+	if ((substream->stream == SNDRV_PCM_STREAM_CAPTURE && dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active)
+	 || (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && dai->stream[SNDRV_PCM_STREAM_CAPTURE].active)) {
 		/* not configure hw_param twice */
 		/* return 0; */
 	}
@@ -809,6 +809,9 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 static int ac108_set_sysclk(struct snd_soc_dai *dai, int clk_id, unsigned int freq, int dir) {
 
 	struct ac10x_priv *ac10x = snd_soc_dai_get_drvdata(dai);
+
+	if (freq != 24000000 || clk_id != SYSCLK_SRC_PLL)
+		dev_warn(dai->dev, "ac108_set_sysclk freq = %d clk = %d\n", freq, clk_id);
 
 	freq = 24000000;
 	clk_id = SYSCLK_SRC_PLL;
@@ -988,7 +991,7 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 /*
  * due to miss channels order in cpu_dai, we meed defer the clock starting.
  */
-static int ac108_set_clock(int y_start_n_stop) {
+static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai) {
 	u8 reg;
 	int ret = 0;
 
@@ -996,6 +999,9 @@ static int ac108_set_clock(int y_start_n_stop) {
 
 	/* spin_lock move to machine trigger */
 
+	if (y_start_n_stop && ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
+		ac101_trigger(substream, cmd, dai);
+	}
 	if (y_start_n_stop && ac10x->sysclk_en == 0) {
 		/* enable lrck clock */
 		ac10x_read(I2S_CTRL, &reg, ac10x->i2cmap[_MASTER_INDEX]);
@@ -1055,39 +1061,36 @@ static int ac108_trigger(struct snd_pcm_substream *substream, int cmd,
 		snd_pcm_stream_str(substream),
 		cmd);
 
-	spin_lock_irqsave(&ac10x->lock, flags);
-
-	if (ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
-		ac101_trigger(substream, cmd, dai);
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		       goto __ret;
-		}
-	}
-
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		spin_lock_irqsave(&ac10x->lock, flags);
 		/* disable global clock if lrck disabled */
 		ac10x_read(I2S_CTRL, &r, ac10x->i2cmap[_MASTER_INDEX]);
 		if ((r & (0x01 << BCLK_IOEN)) && (r & (0x01 << LRCK_IOEN)) == 0) {
 			/* disable global clock */
 			ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x0 << TXEN | 0x0 << GEN, ac10x);
 		}
+		spin_unlock_irqrestore(&ac10x->lock, flags);
 
 		/* delayed clock starting, move to machine trigger() */
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
+			ac101_trigger(substream, cmd, dai);
+		}
 		break;
 	default:
 		ret = -EINVAL;
 	}
 
-__ret:
-	spin_unlock_irqrestore(&ac10x->lock, flags);
-
+	dev_dbg(dai->dev, "%s() stream=%s  cmd=%d; finished %d\n",
+		__FUNCTION__,
+		snd_pcm_stream_str(substream),
+		cmd, ret);
 	return ret;
 }
 
@@ -1121,7 +1124,7 @@ void ac108_aif_shutdown(struct snd_pcm_substream *substream,
 	}
 }
 
-int ac108_aif_mute(struct snd_soc_dai *dai, int mute) {
+int ac108_aif_mute(struct snd_soc_dai *dai, int mute, int direction) {
 	struct snd_soc_codec *codec = dai->codec;
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
 
@@ -1142,12 +1145,13 @@ static const struct snd_soc_dai_ops ac108_dai_ops = {
 	.hw_params	= ac108_hw_params,
 	.prepare	= ac108_prepare,
 	.trigger	= ac108_trigger,
-	.digital_mute	= ac108_aif_mute,
+	.mute_stream	= ac108_aif_mute,
 
 	/*DAI format configuration*/
 	.set_fmt	= ac108_set_fmt,
 
 	// .hw_free = ac108_hw_free,
+	.no_capture_mute = 1,
 };
 
 static  struct snd_soc_dai_driver ac108_dai0 = {
@@ -1321,6 +1325,11 @@ static struct snd_soc_codec_driver ac10x_soc_codec_driver = {
 	.set_bias_level = ac108_set_bias_level,
 	.read		= ac108_codec_read,
 	.write		= ac108_codec_write,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+	.idle_bias_on 	= 1,
+	.use_pmdown_time 	= 1,
+	.endianness 	= 1,
+#endif
 };
 
 static ssize_t ac108_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
@@ -1401,7 +1410,15 @@ static const struct regmap_config ac108_regmap = {
 	.max_register = 0xDF,
 	.cache_type = REGCACHE_FLAT,
 };
-static int ac108_i2c_probe(struct i2c_client *i2c, const struct i2c_device_id *i2c_id) {
+static const struct i2c_device_id ac108_i2c_id[] = {
+	{ "ac108_0", 0 },
+	{ "ac108_1", 1 },
+	{ "ac108_2", 2 },
+	{ "ac108_3", 3 },
+	{ "ac101", AC101_I2C_ID },
+	{ }
+};
+static int ac108_i2c_probe(struct i2c_client *i2c) {
 	struct device_node *np = i2c->dev.of_node;
 	unsigned int val = 0;
 	int ret = 0, index;
@@ -1414,11 +1431,11 @@ static int ac108_i2c_probe(struct i2c_client *i2c, const struct i2c_device_id *i
 		}
 	}
 
-	index = (int)i2c_id->driver_data;
+	index = (int)i2c_match_id(ac108_i2c_id, i2c)->driver_data;
 	if (index == AC101_I2C_ID) {
 		ac10x->i2c101 = i2c;
 		i2c_set_clientdata(i2c, ac10x);
-		ret = ac101_probe(i2c, i2c_id);
+		ret = ac101_probe(i2c, i2c_match_id(ac108_i2c_id, i2c));
 		if (ret) {
 			ac10x->i2c101 = NULL;
 			return ret;
@@ -1436,8 +1453,8 @@ static int ac108_i2c_probe(struct i2c_client *i2c, const struct i2c_device_id *i
 	if (of_property_read_u32(np, "tdm-chips-count", &val)) val = 1;
 	ac10x->tdm_chips_cnt = val;
 
-	pr_err(" ac10x i2c_id number: %d\n", index);
-	pr_err(" ac10x data protocol: %d\n", ac10x->data_protocol);
+	pr_info(" ac10x i2c_id number: %d\n", index);
+	pr_info(" ac10x data protocol: %d\n", ac10x->data_protocol);
 
 	ac10x->i2c[index] = i2c;
 	ac10x->i2cmap[index] = devm_regmap_init_i2c(i2c, &ac108_regmap);
@@ -1459,7 +1476,7 @@ static int ac108_i2c_probe(struct i2c_client *i2c, const struct i2c_device_id *i
 	ac10x_fill_regcache(&i2c->dev, ac10x->i2cmap[index]);
 
 	ac10x->codec_cnt++;
-	pr_err(" ac10x codec count  : %d\n", ac10x->codec_cnt);
+	pr_info(" ac10x codec count  : %d\n", ac10x->codec_cnt);
 
 	ret = sysfs_create_group(&i2c->dev.kobj, &ac108_debug_attr_group);
 	if (ret) {
@@ -1484,7 +1501,7 @@ __ret:
 	return ret;
 }
 
-static int ac108_i2c_remove(struct i2c_client *i2c) {
+static void ac108_i2c_remove(struct i2c_client *i2c) {
 	if (ac10x->codec != NULL) {
 		snd_soc_unregister_codec(&ac10x->i2c[_MASTER_INDEX]->dev);
 		ac10x->codec = NULL;
@@ -1509,17 +1526,8 @@ __ret:
 		kfree(ac10x);
 		ac10x = NULL;
 	}
-	return 0;
 }
 
-static const struct i2c_device_id ac108_i2c_id[] = {
-	{ "ac108_0", 0 },
-	{ "ac108_1", 1 },
-	{ "ac108_2", 2 },
-	{ "ac108_3", 3 },
-	{ "ac101", AC101_I2C_ID },
-	{ }
-};
 MODULE_DEVICE_TABLE(i2c, ac108_i2c_id);
 
 static const struct of_device_id ac108_of_match[] = {

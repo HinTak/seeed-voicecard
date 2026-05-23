@@ -28,6 +28,28 @@
 #include <sound/simple_card_utils.h>
 #include "ac10x.h"
 
+#define LINUX_VERSION_IS_GEQ(x1,x2,x3)	(LINUX_VERSION_CODE >= KERNEL_VERSION(x1,x2,x3))
+
+/* v6.13 renamed snd_soc_pcm_runtime::num to ::id (commit 40e47e2db686). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
+#define seeed_rtd_pcm_index(rtd) ((rtd)->id)
+#else
+#define seeed_rtd_pcm_index(rtd) ((rtd)->num)
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
+#define simple_util_parse_clk_cpu(dev, node, dai_link, simple_dai)      \
+  simple_util_parse_clk(dev, node, simple_dai, dai_link->cpus)
+#define simple_util_parse_clk_codec(dev, node, dai_link, simple_dai)    \
+  simple_util_parse_clk(dev, node, simple_dai, dai_link->codecs)
+#define simple_util_parse_cpu(node, dai_link, is_single_link)           \
+  simple_util_parse_dai(node, dai_link->cpus, is_single_link)
+#define simple_util_parse_codec(node, dai_link)                         \
+  simple_util_parse_dai(node, dai_link->codecs, NULL)
+#define simple_util_parse_platform(node, dai_link)                      \
+  simple_util_parse_dai(node, dai_link->platforms, NULL)
+#endif
+
 /*
  * single codec:
  *	0 - allow multi codec
@@ -38,8 +60,11 @@
 struct seeed_card_data {
 	struct snd_soc_card snd_card;
 	struct seeed_dai_props {
-		struct asoc_simple_dai cpu_dai;
-		struct asoc_simple_dai codec_dai;
+		struct simple_util_dai cpu_dai;
+		struct simple_util_dai codec_dai;
+		struct snd_soc_dai_link_component cpus;   /* single cpu */
+		struct snd_soc_dai_link_component codecs; /* single codec */
+		struct snd_soc_dai_link_component platforms;
 		unsigned int mclk_fs;
 	} *dai_props;
 	unsigned int mclk_fs;
@@ -63,10 +88,11 @@ struct seeed_card_info {
 	const char *platform;
 
 	unsigned int daifmt;
-	struct asoc_simple_dai cpu_dai;
-	struct asoc_simple_dai codec_dai;
+	struct simple_util_dai cpu_dai;
+	struct simple_util_dai codec_dai;
 };
 
+#define seeed_priv_to_card(priv) (&(priv)->snd_card)
 #define seeed_priv_to_dev(priv) ((priv)->snd_card.dev)
 #define seeed_priv_to_link(priv, i) ((priv)->snd_card.dai_link + (i))
 #define seeed_priv_to_props(priv, i) ((priv)->dai_props + (i))
@@ -80,7 +106,7 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct seeed_card_data *priv =	snd_soc_card_get_drvdata(rtd->card);
 	struct seeed_dai_props *dai_props =
-		seeed_priv_to_props(priv, rtd->num);
+		seeed_priv_to_props(priv, seeed_rtd_pcm_index(rtd));
 	int ret;
 
 	ret = clk_prepare_enable(dai_props->cpu_dai.clk);
@@ -91,16 +117,16 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	if (ret)
 		clk_disable_unprepare(dai_props->cpu_dai.clk);
 
-	if (rtd->cpu_dai->driver->playback.channels_min) {
-		priv->channels_playback_default = rtd->cpu_dai->driver->playback.channels_min;
+	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min) {
+		priv->channels_playback_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min;
 	}
-	if (rtd->cpu_dai->driver->capture.channels_min) {
-		priv->channels_capture_default = rtd->cpu_dai->driver->capture.channels_min;
+	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min) {
+		priv->channels_capture_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min;
 	}
-	rtd->cpu_dai->driver->playback.channels_min = priv->channels_playback_override;
-	rtd->cpu_dai->driver->playback.channels_max = priv->channels_playback_override;
-	rtd->cpu_dai->driver->capture.channels_min = priv->channels_capture_override;
-	rtd->cpu_dai->driver->capture.channels_max = priv->channels_capture_override;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_override;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_override;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_override;
 
 	return ret;
 }
@@ -110,12 +136,12 @@ static void seeed_voice_card_shutdown(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct seeed_card_data *priv =	snd_soc_card_get_drvdata(rtd->card);
 	struct seeed_dai_props *dai_props =
-		seeed_priv_to_props(priv, rtd->num);
+		seeed_priv_to_props(priv, seeed_rtd_pcm_index(rtd));
 
-	rtd->cpu_dai->driver->playback.channels_min = priv->channels_playback_default;
-	rtd->cpu_dai->driver->playback.channels_max = priv->channels_playback_default;
-	rtd->cpu_dai->driver->capture.channels_min = priv->channels_capture_default;
-	rtd->cpu_dai->driver->capture.channels_max = priv->channels_capture_default;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_default;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_default;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_default;
+	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_default;
 
 	clk_disable_unprepare(dai_props->cpu_dai.clk);
 
@@ -126,11 +152,11 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 				      struct snd_pcm_hw_params *params)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_dai *codec_dai = rtd->codec_dai;
-	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
+	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct seeed_card_data *priv = snd_soc_card_get_drvdata(rtd->card);
 	struct seeed_dai_props *dai_props =
-		seeed_priv_to_props(priv, rtd->num);
+		seeed_priv_to_props(priv, seeed_rtd_pcm_index(rtd));
 	unsigned int mclk, mclk_fs = 0;
 	int ret = 0;
 
@@ -157,9 +183,9 @@ err:
 }
 
 #define _SET_CLOCK_CNT		2
-static int (* _set_clock[_SET_CLOCK_CNT])(int y_start_n_stop);
+static int (* _set_clock[_SET_CLOCK_CNT])(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai);
 
-int seeed_voice_card_register_set_clock(int stream, int (*set_clock)(int)) {
+int seeed_voice_card_register_set_clock(int stream, int (*set_clock)(int, struct snd_pcm_substream *, int, struct snd_soc_dai *)) {
 	if (! _set_clock[stream]) {
 		_set_clock[stream] = set_clock;
 	}
@@ -176,10 +202,10 @@ static void work_cb_codec_clk(struct work_struct *work)
 	int r = 0;
 
 	if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) {
-		r = r || _set_clock[SNDRV_PCM_STREAM_CAPTURE](0);
+		r = r || _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
 	}
 	if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) {
-		r = r || _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0);
+		r = r || _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
 	}
 
 	if (r && priv->try_stop++ < TRY_STOP_MAX) {
@@ -191,7 +217,7 @@ static void work_cb_codec_clk(struct work_struct *work)
 static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_dai *dai = rtd->codec_dai;
+	struct snd_soc_dai *dai = snd_soc_rtd_to_codec(rtd, 0);
 	struct seeed_card_data *priv = snd_soc_card_get_drvdata(rtd->card);
 	#if CONFIG_AC10X_TRIG_LOCK
 	unsigned long flags;
@@ -200,7 +226,7 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 
 	dev_dbg(rtd->card->dev, "%s() stream=%s  cmd=%d play:%d, capt:%d\n",
 		__FUNCTION__, snd_pcm_stream_str(substream), cmd,
-		dai->playback_active, dai->capture_active);
+		dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active, dai->stream[SNDRV_PCM_STREAM_CAPTURE].active);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -211,8 +237,8 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 		/* I know it will degrades performance, but I have no choice */
 		spin_lock_irqsave(&priv->lock, flags);
 		#endif
-		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](1);
-		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](1);
+		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
+		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, substream, cmd, dai);
 		#if CONFIG_AC10X_TRIG_LOCK
 		spin_unlock_irqrestore(&priv->lock, flags);
 		#endif
@@ -222,7 +248,7 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		/* capture channel resync, if overrun */
-		if (dai->capture_active && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		if (dai->stream[SNDRV_PCM_STREAM_CAPTURE].active && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			break;
 		}
 
@@ -232,13 +258,17 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 			if (0 != schedule_work(&priv->work_codec_clk)) {
 			}
 		} else {
-			if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0);
-			if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0);
+			if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
+			if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
 		}
 		break;
 	default:
 		ret = -EINVAL;
 	}
+
+	dev_dbg(rtd->card->dev, "%s() stream=%s  cmd=%d play:%d, capt:%d;finished %d\n",
+		__FUNCTION__, snd_pcm_stream_str(substream), cmd,
+		dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active, dai->stream[SNDRV_PCM_STREAM_CAPTURE].active, ret);
 
 	return ret;
 }
@@ -250,23 +280,165 @@ static struct snd_soc_ops seeed_voice_card_ops = {
 	.trigger = seeed_voice_card_trigger,
 };
 
+static int simple_util_parse_dai(struct device_node *node,
+				 struct snd_soc_dai_link_component *dlc,
+				 int *is_single_link)
+{
+	struct of_phandle_args args;
+	int ret;
+
+	if (!node)
+		return 0;
+
+	/*
+	 * Get node via "sound-dai = <&phandle port>"
+	 * it will be used as xxx_of_node on soc_bind_dai_link()
+	 */
+	ret = of_parse_phandle_with_args(node, DAI, CELL, 0, &args);
+	if (ret)
+		return ret;
+
+	/*
+	 * FIXME
+	 *
+	 * Here, dlc->dai_name is pointer to CPU/Codec DAI name.
+	 * If user unbinded CPU or Codec driver, but not for Sound Card,
+	 * dlc->dai_name is keeping unbinded CPU or Codec
+	 * driver's pointer.
+	 *
+	 * If user re-bind CPU or Codec driver again, ALSA SoC will try
+	 * to rebind Card via snd_soc_try_rebind_card(), but because of
+	 * above reason, it might can't bind Sound Card.
+	 * Because Sound Card is pointing to released dai_name pointer.
+	 *
+	 * To avoid this rebind Card issue,
+	 * 1) It needs to alloc memory to keep dai_name eventhough
+	 *    CPU or Codec driver was unbinded, or
+	 * 2) user need to rebind Sound Card everytime
+	 *    if he unbinded CPU or Codec.
+	 */
+	ret = snd_soc_of_get_dai_name(node, &dlc->dai_name, 0);
+	if (ret < 0)
+		return ret;
+
+	dlc->of_node = args.np;
+
+	if (is_single_link)
+		*is_single_link = !args.args_count;
+
+	return 0;
+}
+
+static int simple_util_init_dai(struct snd_soc_dai *dai,
+				     struct simple_util_dai *simple_dai)
+{
+	int ret;
+
+	if (!simple_dai)
+		return 0;
+
+	if (simple_dai->sysclk) {
+		ret = snd_soc_dai_set_sysclk(dai, 0, simple_dai->sysclk,
+					     simple_dai->clk_direction);
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(dai->dev, "simple-card: set_sysclk error\n");
+			return ret;
+		}
+	}
+
+	if (simple_dai->slots) {
+		ret = snd_soc_dai_set_bclk_ratio(dai,
+					       simple_dai->slots *
+					       simple_dai->slot_width);
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(dai->dev, "simple-card: set_tdm_slot error\n");
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+static inline int simple_util_component_is_codec(struct snd_soc_component *component)
+{
+	return component->driver->endianness;
+}
+
+static int simple_util_init_dai_link_params(struct snd_soc_pcm_runtime *rtd)
+{
+	struct snd_soc_dai_link *dai_link = rtd->dai_link;
+	struct snd_soc_component *component;
+	struct snd_soc_pcm_stream *params;
+	struct snd_pcm_hardware hw;
+	int i, ret, stream;
+
+	/* Only Codecs */
+	for_each_rtd_components(rtd, i, component) {
+		if (!simple_util_component_is_codec(component))
+			return 0;
+	}
+
+	/* Assumes the capabilities are the same for all supported streams */
+	for (stream = 0; stream < 2; stream++) {
+		ret = snd_soc_runtime_calc_hw(rtd, &hw, stream);
+		if (ret == 0)
+			break;
+	}
+
+	if (ret < 0) {
+		dev_err(rtd->dev, "simple-card: no valid dai_link params\n");
+		return ret;
+	}
+
+	params = devm_kzalloc(rtd->dev, sizeof(*params), GFP_KERNEL);
+	if (!params)
+		return -ENOMEM;
+
+	params->formats = hw.formats;
+	params->rates = hw.rates;
+	params->rate_min = hw.rate_min;
+	params->rate_max = hw.rate_max;
+	params->channels_min = hw.channels_min;
+	params->channels_max = hw.channels_max;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
+	dai_link->c2c_params = params;
+	dai_link->num_c2c_params = 1;
+#else
+	/* apparently this goes back to 5.6.x */
+	dai_link->params = params;
+	dai_link->num_params = 1;
+#endif
+
+	return 0;
+}
+#endif
+
 static int seeed_voice_card_dai_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct seeed_card_data *priv =	snd_soc_card_get_drvdata(rtd->card);
-	struct snd_soc_dai *codec = rtd->codec_dai;
-	struct snd_soc_dai *cpu = rtd->cpu_dai;
+	struct snd_soc_dai *codec = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *cpu = snd_soc_rtd_to_cpu(rtd, 0);
 	struct seeed_dai_props *dai_props =
-		seeed_priv_to_props(priv, rtd->num);
+		seeed_priv_to_props(priv, seeed_rtd_pcm_index(rtd));
 	int ret;
 
-	ret = asoc_simple_card_init_dai(codec, &dai_props->codec_dai);
+	ret = simple_util_init_dai(codec, &dai_props->codec_dai);
 	if (ret < 0)
 		return ret;
 
-	ret = asoc_simple_card_init_dai(cpu, &dai_props->cpu_dai);
+	ret = simple_util_init_dai(cpu, &dai_props->cpu_dai);
 	if (ret < 0)
 		return ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+	ret = simple_util_init_dai_link_params(rtd);
+	if (ret < 0)
+		return ret;
+#endif
+
+	dev_dbg(rtd->card->dev, "codec \"%s\" mapping to cpu \"%s\"\n", codec->name, cpu->name);
 	return 0;
 }
 
@@ -278,8 +450,8 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	struct device *dev = seeed_priv_to_dev(priv);
 	struct snd_soc_dai_link *dai_link = seeed_priv_to_link(priv, idx);
 	struct seeed_dai_props *dai_props = seeed_priv_to_props(priv, idx);
-	struct asoc_simple_dai *cpu_dai = &dai_props->cpu_dai;
-	struct asoc_simple_dai *codec_dai = &dai_props->codec_dai;
+	struct simple_util_dai *cpu_dai = &dai_props->cpu_dai;
+	struct simple_util_dai *codec_dai = &dai_props->codec_dai;
 	struct device_node *cpu = NULL;
 	struct device_node *plat = NULL;
 	struct device_node *codec = NULL;
@@ -312,20 +484,19 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 		goto dai_link_of_err;
 	}
 
-	ret = asoc_simple_card_parse_daifmt(dev, node, codec,
+	ret = simple_util_parse_daifmt(dev, node, codec,
 					    prefix, &dai_link->dai_fmt);
 	if (ret < 0)
 		goto dai_link_of_err;
 
 	of_property_read_u32(node, "mclk-fs", &dai_props->mclk_fs);
 
-	ret = asoc_simple_card_parse_cpu(cpu, dai_link,
-					 DAI, CELL, &single_cpu);
+	ret = simple_util_parse_cpu(cpu, dai_link, &single_cpu);
 	if (ret < 0)
 		goto dai_link_of_err;
 
 	#if _SINGLE_CODEC
-	ret = asoc_simple_card_parse_codec(codec, dai_link, DAI, CELL);
+	ret = simple_util_parse_codec(codec, dai_link);
 	if (ret < 0)
 		goto dai_link_of_err;
 	#else
@@ -337,7 +508,7 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	dev_dbg(dev, "dai_link num_codecs = %d\n", dai_link->num_codecs);
 	#endif
 
-	ret = asoc_simple_card_parse_platform(plat, dai_link, DAI, CELL);
+	ret = simple_util_parse_platform(plat, dai_link);
 	if (ret < 0)
 		goto dai_link_of_err;
 
@@ -360,32 +531,26 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 		goto dai_link_of_err;
 
 	#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,10,0)
-	ret = asoc_simple_card_parse_clk_cpu(cpu, dai_link, cpu_dai);
+	ret = simple_util_card_parse_clk_cpu(cpu, dai_link, cpu_dai);
 	#else
-	ret = asoc_simple_card_parse_clk_cpu(dev, cpu, dai_link, cpu_dai);
+	ret = simple_util_parse_clk_cpu(dev, cpu, dai_link, cpu_dai);
 	#endif
 	if (ret < 0)
 		goto dai_link_of_err;
 
 	#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,10,0)
-	ret = asoc_simple_card_parse_clk_codec(codec, dai_link, codec_dai);
+	ret = simple_util_card_parse_clk_codec(codec, dai_link, codec_dai);
 	#else
-	ret = asoc_simple_card_parse_clk_codec(dev, codec, dai_link, codec_dai);
+	ret = simple_util_parse_clk_codec(dev, codec, dai_link, codec_dai);
 	#endif
 	if (ret < 0)
 		goto dai_link_of_err;
 
-	#if _SINGLE_CODEC
-	ret = asoc_simple_card_canonicalize_dailink(dai_link);
-	if (ret < 0)
-		goto dai_link_of_err;
-	#endif
-
-	ret = asoc_simple_card_set_dailink_name(dev, dai_link,
+	ret = simple_util_set_dailink_name(dev, dai_link,
 						"%s-%s",
-						dai_link->cpu_dai_name,
+						dai_link->cpus->dai_name,
 						#if _SINGLE_CODEC
-						dai_link->codec_dai_name
+						dai_link->codecs->dai_name
 						#else
 						dai_link->codecs[0].dai_name
 						#endif
@@ -399,17 +564,27 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	dev_dbg(dev, "\tname : %s\n", dai_link->stream_name);
 	dev_dbg(dev, "\tformat : %04x\n", dai_link->dai_fmt);
 	dev_dbg(dev, "\tcpu : %s / %d\n",
-		dai_link->cpu_dai_name,
+		dai_link->cpus->dai_name,
 		dai_props->cpu_dai.sysclk);
 	dev_dbg(dev, "\tcodec : %s / %d\n",
 		#if _SINGLE_CODEC
-		dai_link->codec_dai_name,
+		dai_link->codecs->dai_name,
 		#else
 		dai_link->codecs[0].dai_name,
 		#endif
 		dai_props->codec_dai.sysclk);
 
-	asoc_simple_card_canonicalize_cpu(dai_link, single_cpu);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
+	simple_util_canonicalize_cpu(dai_link->cpus, single_cpu);
+	#if _SINGLE_CODEC
+	simple_util_canonicalize_platform(dai_link->platforms, dai_link->cpus);
+	#endif
+#else
+	simple_util_canonicalize_cpu(dai_link, single_cpu);
+	#if _SINGLE_CODEC
+	simple_util_canonicalize_platform(dai_link);
+	#endif
+#endif
 
 dai_link_of_err:
 	of_node_put(cpu);
@@ -441,7 +616,7 @@ static int seeed_voice_card_parse_aux_devs(struct device_node *node,
 		aux_node = of_parse_phandle(node, PREFIX "aux-devs", i);
 		if (!aux_node)
 			return -EINVAL;
-		priv->snd_card.aux_dev[i].codec_of_node = aux_node;
+		priv->snd_card.aux_dev[i].dlc.of_node = aux_node;
 	}
 
 	priv->snd_card.num_aux_devs = n;
@@ -501,7 +676,7 @@ static int seeed_voice_card_parse_of(struct device_node *node,
 			goto card_parse_end;
 	}
 
-	ret = asoc_simple_card_parse_card_name(&priv->snd_card, PREFIX);
+	ret = simple_util_parse_card_name(&priv->snd_card, PREFIX);
 	if (ret < 0)
 		goto card_parse_end;
 
@@ -526,6 +701,79 @@ card_parse_end:
 	return ret;
 }
 
+#ifdef DEBUG
+inline void seeed_debug_dai(struct seeed_card_data *priv,
+				  char *name,
+				  struct simple_util_dai *dai)
+{
+	struct device *dev = seeed_priv_to_dev(priv);
+
+	if (dai->name)
+		dev_dbg(dev, "%s dai name = %s\n",
+			name, dai->name);
+	if (dai->sysclk)
+		dev_dbg(dev, "%s sysclk = %d\n",
+			name, dai->sysclk);
+
+	dev_dbg(dev, "%s direction = %s\n",
+		name, dai->clk_direction ? "OUT" : "IN");
+
+	if (dai->slots)
+		dev_dbg(dev, "%s slots = %d\n", name, dai->slots);
+	if (dai->slot_width)
+		dev_dbg(dev, "%s slot width = %d\n", name, dai->slot_width);
+	if (dai->tx_slot_mask)
+		dev_dbg(dev, "%s tx slot mask = %d\n", name, dai->tx_slot_mask);
+	if (dai->rx_slot_mask)
+		dev_dbg(dev, "%s rx slot mask = %d\n", name, dai->rx_slot_mask);
+	if (dai->clk)
+		dev_dbg(dev, "%s clk %luHz\n", name, clk_get_rate(dai->clk));
+}
+
+inline void seeed_debug_info(struct seeed_card_data *priv)
+{
+	struct snd_soc_card *card = seeed_priv_to_card(priv);
+	struct device *dev = seeed_priv_to_dev(priv);
+
+	int i;
+
+	if (card->name)
+		dev_dbg(dev, "Card Name: %s\n", card->name);
+
+	for (i = 0; i < card->num_links; i++) {
+		struct seeed_dai_props *props = seeed_priv_to_props(priv, i);
+		struct snd_soc_dai_link *link = seeed_priv_to_link(priv, i);
+
+		dev_dbg(dev, "DAI%d\n", i);
+
+		seeed_debug_dai(priv, "cpu", &props->cpu_dai);
+		seeed_debug_dai(priv, "codec", &props->codec_dai);
+
+		if (link->name)
+			dev_dbg(dev, "dai name = %s\n", link->name);
+
+		dev_dbg(dev, "dai format = %04x\n", link->dai_fmt);
+
+		/*
+		if (props->adata.convert_rate)
+			dev_dbg(dev, "convert_rate = %d\n",
+				props->adata.convert_rate);
+		if (props->adata.convert_channels)
+			dev_dbg(dev, "convert_channels = %d\n",
+				props->adata.convert_channels);
+		if (props->codec_conf && props->codec_conf->name_prefix)
+			dev_dbg(dev, "name prefix = %s\n",
+				props->codec_conf->name_prefix);
+		*/
+		if (props->mclk_fs)
+			dev_dbg(dev, "mclk-fs = %d\n",
+				props->mclk_fs);
+	}
+}
+#else
+#define  seeed_debug_info(priv)
+#endif /* DEBUG */
+
 static int seeed_voice_card_probe(struct platform_device *pdev)
 {
 	struct seeed_card_data *priv;
@@ -533,7 +781,7 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 	struct seeed_dai_props *dai_props;
 	struct device_node *np = pdev->dev.of_node;
 	struct device *dev = &pdev->dev;
-	int num, ret;
+	int num, ret, i;
 
 	/* Get the number of DAI links */
 	if (np && of_get_child_by_name(np, PREFIX "dai-link"))
@@ -550,6 +798,25 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 	dai_link  = devm_kzalloc(dev, sizeof(*dai_link)  * num, GFP_KERNEL);
 	if (!dai_props || !dai_link)
 		return -ENOMEM;
+
+	/*
+	 * Use snd_soc_dai_link_component instead of legacy style
+	 * It is codec only. but cpu/platform will be supported in the future.
+	 * see
+	 *      soc-core.c :: snd_soc_init_multicodec()
+	 *
+	 * "platform" might be removed
+	 * see
+	 *      simple-card-utils.c :: simple_util_canonicalize_platform()
+	 */
+	for (i = 0; i < num; i++) {
+		dai_link[i].cpus		= &dai_props[i].cpus;
+		dai_link[i].num_cpus		= 1;
+		dai_link[i].codecs		= &dai_props[i].codecs;
+		dai_link[i].num_codecs		= 1;
+		dai_link[i].platforms		= &dai_props[i].platforms;
+		dai_link[i].num_platforms	= 1;
+	}
 
 	priv->dai_props			= dai_props;
 	priv->dai_link			= dai_link;
@@ -569,6 +836,9 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 		}
 	} else {
 		struct seeed_card_info *cinfo;
+		struct snd_soc_dai_link_component *cpus;
+		struct snd_soc_dai_link_component *codecs;
+		struct snd_soc_dai_link_component *platform;
 
 		cinfo = dev->platform_data;
 		if (!cinfo) {
@@ -585,13 +855,19 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 			return -EINVAL;
 		}
 
+		cpus			= dai_link->cpus;
+		cpus->dai_name		= cinfo->cpu_dai.name;
+
+		codecs			= dai_link->codecs;
+		codecs->name		= cinfo->codec;
+		codecs->dai_name	= cinfo->codec_dai.name;
+
+		platform		= dai_link->platforms;
+		platform->name		= cinfo->platform;
+
 		priv->snd_card.name	= (cinfo->card) ? cinfo->card : cinfo->name;
 		dai_link->name		= cinfo->name;
 		dai_link->stream_name	= cinfo->name;
-		dai_link->platform_name	= cinfo->platform;
-		dai_link->codec_name	= cinfo->codec;
-		dai_link->cpu_dai_name	= cinfo->cpu_dai.name;
-		dai_link->codec_dai_name = cinfo->codec_dai.name;
 		dai_link->dai_fmt	= cinfo->daifmt;
 		dai_link->init		= seeed_voice_card_dai_init;
 		memcpy(&priv->dai_props->cpu_dai, &cinfo->cpu_dai,
@@ -608,24 +884,28 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 
 	INIT_WORK(&priv->work_codec_clk, work_cb_codec_clk);
 
+	seeed_debug_info(priv);
+
 	ret = devm_snd_soc_register_card(&pdev->dev, &priv->snd_card);
 	if (ret >= 0)
 		return ret;
 
 err:
-	asoc_simple_card_clean_reference(&priv->snd_card);
+	simple_util_clean_reference(&priv->snd_card);
 
 	return ret;
 }
 
-static int seeed_voice_card_remove(struct platform_device *pdev)
+static void seeed_voice_card_remove(struct platform_device *pdev)
 {
 	struct snd_soc_card *card = platform_get_drvdata(pdev);
 	struct seeed_card_data *priv = snd_soc_card_get_drvdata(card);
 
 	if (cancel_work_sync(&priv->work_codec_clk) != 0) {
 	}
-	return asoc_simple_card_clean_reference(card);
+	simple_util_clean_reference(card);
+
+	return;
 }
 
 static const struct of_device_id seeed_voice_of_match[] = {

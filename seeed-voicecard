@@ -21,13 +21,18 @@
 # THE SOFTWARE.
 
 set -x
-exec 1>/var/log/$(basename $0).log 2>&1
+#exec 1>/var/log/$(basename $0).log 2>&1
+
+export PATH=$PATH:/opt/vc/bin
+OVERLAYS=/boot/overlays
+[ -d /boot/firmware/overlays ] && OVERLAYS=/boot/firmware/overlays
+
 #enable i2c interface
-dtparam i2c_arm=on
+dtparam -d $OVERLAYS i2c_arm=on
 modprobe i2c-dev
 
 #enable spi interface
-dtparam spi=on
+dtparam -d $OVERLAYS spi=on
 
 _VER_RUN=
 function get_kernel_version() {
@@ -37,13 +42,17 @@ function get_kernel_version() {
     [ -z "$_VER_RUN" ] && {
         ZIMAGE=/boot/kernel.img
         IMG_OFFSET=$(LC_ALL=C grep -abo $'\x1f\x8b\x08\x00' $ZIMAGE | head -n 1 | cut -d ':' -f 1)
-        _VER_RUN=$(dd if=$ZIMAGE obs=64K ibs=4 skip=$(( IMG_OFFSET / 4)) | zcat | grep -a -m1 "Linux version" | strings | awk '{ print $3; }')
+        # 64-bit-only kernel package
+        [ ! -f /boot/kernel.img ] && [ -f /boot/kernel8.img ] && ZIMAGE=/boot/kernel8.img
+        _VER_RUN=$(dd if=$ZIMAGE obs=64K ibs=4 skip=$(( IMG_OFFSET / 4)) 2>/dev/null | zcat | grep -a -m1 "Linux version" | LC_ALL=C sed -e 's/^.*Linux/Linux/' | strings | awk '{ print $3; }')
     }
     echo "$_VER_RUN"
     return 0
 }
 
 CONFIG=/boot/config.txt
+[ -f /boot/firmware/usercfg.txt ] && CONFIG=/boot/firmware/usercfg.txt
+
 get_overlay() {
     ov=$1
     if grep -q -E "^dtoverlay=$ov" $CONFIG; then
@@ -115,25 +124,23 @@ if [ "$overlay" ]; then
     rm /etc/asound.conf
     rm /var/lib/alsa/asound.state
 
-: <<\EOF
-    kernel_ver=$(get_kernel_version)
+    kernel_ver=$(uname -r) # get_kernel_version)
     # echo kernel_ver=$kernel_ver
 
     # TODO: dynamic dtoverlay Bug of v4.19.x
     #       no DT node phandle inserted.
-    if [[ "$kernel_ver" =~ ^4\.19.*$ ]]; then
+    if [[ "$kernel_ver" =~ ^4\.19.*$ || "$kernel_ver" =~ ^5\.*$ ]]; then
         for i in $RPI_HATS; do
             if [ "$i" == "$overlay" ]; then
-                do_overlay $overlay 0
+                /bin/true #do_overlay $overlay 0
             else
                 echo Uninstall $i ...
-                do_overlay $i 1
+                /bin/true #do_overlay $i 1
             fi
         done
     fi
-EOF
     #make sure the driver loads correctly
-    dtoverlay $overlay || true
+    dtoverlay -d $OVERLAYS $overlay || true
 
 
     echo "create $overlay asound configure file"
@@ -145,5 +152,12 @@ fi
 alsactl restore
 
 #Force 3.5mm ('headphone') jack
-amixer cset numid=3 1 
-
+#   The Raspberry Pi 4, released on 24th Jun 2019, has two HDMI ports,
+#   and can drive two displays with audios for two users simultaneously,
+#   in a "multiseat" configuration. The earlier single virtual ALSA
+#   option for re-directing audio playback between headphone jack and HDMI
+#   via a 'Routing' mixer setting was turned off eventually to allow
+#   simultaneous usage of all 3 playback devices.
+if aplay -l | grep -q "bcm2835 ALSA"; then
+    amixer cset numid=3 1 || true
+fi
