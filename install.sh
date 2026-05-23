@@ -69,6 +69,8 @@ function get_kernel_version() {
     [ -f /boot/firmware/vmlinuz ] && ZIMAGE=/boot/firmware/vmlinuz
     # 64-bit-only kernel package
     [ ! -f /boot/kernel.img ] && [ -f /boot/kernel8.img ] && ZIMAGE=/boot/kernel8.img
+    # Raspberry Pi 5 (bcm2712) ships kernel_2712.img alongside kernel8.img
+    [ -f /boot/firmware/kernel_2712.img ] && ZIMAGE=/boot/firmware/kernel_2712.img
     IMG_OFFSET=$(LC_ALL=C grep -abo $'\x1f\x8b\x08\x00' $ZIMAGE | head -n 1 | cut -d ':' -f 1)
     _VER_RUN=$(dd if=$ZIMAGE obs=64K ibs=4 skip=$(( IMG_OFFSET / 4)) 2>/dev/null | zcat | grep -a -m1 "Linux version" | LC_ALL=C sed -e 's/^.*Linux/Linux/' | strings | awk '{ print $3; }')
   }
@@ -78,11 +80,14 @@ function get_kernel_version() {
 
 function check_kernel_headers() {
   VER_RUN=$(get_kernel_version)
-  VER_HDR=$(dpkg -L raspberrypi-kernel-headers | egrep -m1 "/lib/modules/[^\/]+/build" | awk -F'/' '{ print $4; }')
+  # Headers may live under /lib/modules/<ver>/build (older layouts) or
+  # /usr/lib/modules/<ver>/build (Debian Trixie / usrmerge). Extract <ver>
+  # via sed so the prefix doesn't matter.
+  VER_HDR=$(dpkg -L raspberrypi-kernel-headers 2>/dev/null | sed -nE 's|^.*/lib/modules/([^/]+)/build$|\1|p' | head -n1)
   [ "X$VER_RUN" == "X$VER_HDR" ] && {
     return 0
   }
-  VER_HDR=$(dpkg -L linux-headers-$VER_RUN | egrep -m1 "/lib/modules/[^\/]+/build" | awk -F'/' '{ print $4; }')
+  VER_HDR=$(dpkg -L linux-headers-$VER_RUN 2>/dev/null | sed -nE 's|^.*/lib/modules/([^/]+)/build$|\1|p' | head -n1)
   [ "X$VER_RUN" == "X$VER_HDR" ] && {
     return 0
   }
@@ -106,12 +111,14 @@ function check_kernel_headers() {
 which apt &>/dev/null
 if [[ $? -eq 0 ]]; then
   apt update -y
-  # Raspbian kernel packages
-  apt-get -y install raspberrypi-kernel-headers raspberrypi-kernel
+  # Raspbian/legacy kernel packages (absent on Debian Trixie+; ignore failure)
+  apt-get -y install raspberrypi-kernel-headers raspberrypi-kernel || true
+  # Debian Trixie / Raspberry Pi OS Bookworm+ kernel packages
+  apt-get -y install "linux-headers-$(uname -r)" || true
   # Recent Raspbian has 64-bit kernel on 32-bit userspace
-  apt-get -y install gcc-aarch64-linux-gnu
+  apt-get -y install gcc-aarch64-linux-gnu || true
   # Ubuntu kernel packages
-  apt-get -y install linux-raspi linux-headers-raspi linux-image-raspi
+  apt-get -y install linux-raspi linux-headers-raspi linux-image-raspi || true
   apt-get -y install dkms git i2c-tools libasound2-plugins
   # rpi-update checker
   check_kernel_headers
@@ -185,8 +192,12 @@ CONFIG=/boot/config.txt
 [ -f /boot/firmware/usercfg.txt ] && CONFIG=/boot/firmware/usercfg.txt
 
 sed -i -e 's:#dtparam=i2c_arm=on:dtparam=i2c_arm=on:g'  $CONFIG || true
-grep -q "^dtoverlay=i2s-mmap$" $CONFIG || \
-  echo "dtoverlay=i2s-mmap" >> $CONFIG
+# i2s-mmap was removed from recent Raspberry Pi firmware (mmap support is
+# now native in the I2S driver); only enable it if the overlay still ships.
+if [ -f "$OVERLAYS/i2s-mmap.dtbo" ]; then
+  grep -q "^dtoverlay=i2s-mmap$" $CONFIG || \
+    echo "dtoverlay=i2s-mmap" >> $CONFIG
+fi
 
 
 grep -q "^dtparam=i2s=on$" $CONFIG || \
