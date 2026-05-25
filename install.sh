@@ -77,43 +77,50 @@ function get_kernel_version() {
 }
 
 function check_kernel_headers() {
-  VER_RUN=$(get_kernel_version)
-  VER_HDR=$(dpkg -L raspberrypi-kernel-headers | egrep -m1 "/lib/modules/[^\/]+/build" | awk -F'/' '{ print $4; }')
-  [ "X$VER_RUN" == "X$VER_HDR" ] && {
+  # Verify that build headers exist for the *running* kernel.
+  # This used to offer to revert the kernel (apt --reinstall raspberrypi-kernel)
+  # on a mismatch. That is removed on purpose: on Raspberry Pi 5 reinstalling the
+  # legacy kernel image package can overwrite /boot/firmware (base DTB + overlays)
+  # and break the CSI camera (CAM0/CAM1). We only warn here and never touch the
+  # kernel image.
+  local build_dir="/lib/modules/$(uname -r)/build"
+  if [ -d "$build_dir" ]; then
     return 0
-  }
-  VER_HDR=$(dpkg -L linux-headers-$VER_RUN | egrep -m1 "/lib/modules/[^\/]+/build" | awk -F'/' '{ print $4; }')
-  [ "X$VER_RUN" == "X$VER_HDR" ] && {
-    return 0
-  }
-
-  # echo RUN=$VER_RUN HDR=$VER_HDR
-  echo " !!! Your kernel version is $VER_RUN"
-  echo "     Not found *** corresponding *** kernel headers with apt-get."
-  echo "     This may occur if you have ran 'rpi-update'."
-  echo " Choose  *** y *** will revert the kernel to version $VER_HDR then continue."
-  echo " Choose  *** N *** will exit without this driver support, by default."
-  read -p "Would you like to proceed? (y/N)" -n 1 -r -s
-  echo
-  if ! [[ $REPLY =~ ^[Yy]$ ]]; then
-    exit 1;
   fi
 
-  apt-get -y --reinstall install raspberrypi-kernel
+  echo " !!! Kernel headers for the running kernel ($(uname -r)) were not found."
+  echo "     Expected build directory: $build_dir"
+  echo "     Install the matching headers package and re-run, e.g.:"
+  echo "       sudo apt-get install linux-headers-$(uname -r)"
+  echo "       (or linux-headers-rpi-2712 / linux-headers-rpi-v8)"
+  echo "     NOT reverting the kernel automatically: doing so on a Raspberry Pi 5"
+  echo "     can overwrite firmware/device-tree and break the camera."
 }
 
 # update and install required packages
 which apt &>/dev/null
 if [[ $? -eq 0 ]]; then
   apt update -y
-  # Raspbian kernel packages
-  apt-get -y install raspberrypi-kernel-headers raspberrypi-kernel
-  # Recent Raspbian has 64-bit kernel on 32-bit userspace
-  apt-get -y install gcc-aarch64-linux-gnu
-  # Ubuntu kernel packages
-  apt-get -y install linux-raspi linux-headers-raspi linux-image-raspi
+
+  # Install kernel HEADERS only, matching the running kernel.
+  #
+  # IMPORTANT: never (re)install a kernel *image* package here. On Raspberry Pi
+  # OS the legacy 'raspberrypi-kernel' meta-package can pull an obsolete,
+  # pre-Pi-5 kernel and overwrite /boot/firmware (base DTB + overlays). On a
+  # Raspberry Pi 5 that breaks the CSI camera (CAM0/CAM1) even though the
+  # running kernel still boots fine. We only need headers to build the modules.
+  uname_r="$(uname -r)"
+  apt-get -y install "linux-headers-${uname_r}" \
+    || apt-get -y install linux-headers-rpi-2712 linux-headers-rpi-v8 \
+    || apt-get -y install raspberrypi-kernel-headers \
+    || apt-get -y install linux-headers-raspi \
+    || echo "WARNING: could not install kernel headers for ${uname_r}; DKMS build may fail."
+
   apt-get -y install dkms git i2c-tools libasound2-plugins
-  # rpi-update checker
+  # Optional: cross compiler for 64-bit kernel on 32-bit userspace setups.
+  apt-get -y install gcc-aarch64-linux-gnu || true
+
+  # Verify headers are present for the running kernel (warns only; never reverts the kernel).
   check_kernel_headers
 fi
 
