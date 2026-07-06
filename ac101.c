@@ -433,7 +433,7 @@ _err_input_register_device:
 _err_input_allocate_device:
 
 	if (ac10x->irq) {
-		devm_free_irq(&i2c->dev, ac10x->irq, ac10x);
+		devm_free_irq(ac10x->codec->dev, ac10x->irq, ac10x);
 		ac10x->irq = 0;
 	}
 _err_irq:
@@ -751,6 +751,10 @@ static int snd_ac101_put_volsw(struct snd_kcontrol *kcontrol,
 	if (sign_bit)
 		mask = BIT(sign_bit + 1) - 1;
 
+	if (ucontrol->value.integer.value[0] < 0 ||
+	    ucontrol->value.integer.value[0] > mc->max)
+		return -EINVAL;
+
 	val = ((ucontrol->value.integer.value[0] + mc->min) & mask);
 	if (invert) {
 		val = mc->max - val;
@@ -1016,6 +1020,10 @@ static int ac101_set_pll(struct snd_soc_dai *codec_dai, int pll_id, int source,
 			break;
 		}
 	}
+	if (i >= ARRAY_SIZE(codec_pll_div)) {
+		pr_err("ac101: no PLL divider for in=%u out=%u\n", freq_in, freq_out);
+		return -EINVAL;
+	}
 	/* config pll m */
 	if (m  == 64) m = 0;
 	ac101_update_bits(codec, PLL_CTRL1, (0x3f<<PLL_POSTDIV_M), (m<<PLL_POSTDIV_M));
@@ -1074,6 +1082,10 @@ int ac101_hw_params(struct snd_pcm_substream *substream,
 			break;
 		}
 	}
+	if (i >= ARRAY_SIZE(codec_aif1_lrck)) {
+		dev_err(codec->dev, "ac101: no LRCK/BCLK ratio for %d\n", aif1_lrck_div);
+		return -EINVAL;
+	}
 	ac101_update_bits(codec, AIF_CLK_CTRL, (0x7<<AIF1_LRCK_DIV), codec_aif1_lrck[i].bit<<AIF1_LRCK_DIV);
 
 	/* set PLL output freq */
@@ -1090,12 +1102,20 @@ int ac101_hw_params(struct snd_pcm_substream *substream,
 			break;
 		}
 	}
+	if (i >= ARRAY_SIZE(codec_aif1_fs)) {
+		dev_err(codec->dev, "ac101: unsupported rate %d\n", params_rate(params));
+		return -EINVAL;
+	}
 
 	/* set I2S word size */
 	for (i = 0; i < ARRAY_SIZE(codec_aif1_wsize); i++) {
 		if (codec_aif1_wsize[i].val == aif1_word_size) {
 			break;
 		}
+	}
+	if (i >= ARRAY_SIZE(codec_aif1_wsize)) {
+		dev_err(codec->dev, "ac101: unsupported word size %d\n", aif1_word_size);
+		return -EINVAL;
 	}
 	ac101_update_bits(codec, AIF_CLK_CTRL, (0x3<<AIF1_WORK_SIZ), ((codec_aif1_wsize[i].bit)<<AIF1_WORK_SIZ));
 
@@ -1258,7 +1278,13 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct snd_soc_codec *codec = dai->codec;
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
 	int ret = 0;
-	unsigned long flags;
+
+	/*
+	 * Assert process context: this runs sleeping regmap-I2C below. With the
+	 * machine dai_link marked nonatomic, .trigger runs in process context.
+	 * If a future change re-introduces atomic context, might_sleep() screams.
+	 */
+	might_sleep();
 
 	AC101_DBG("stream=%s  cmd=%d\n",
 		snd_pcm_stream_str(substream),
@@ -1269,7 +1295,13 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		#if _MASTER_MULTI_CODEC == _MASTER_AC101
-		spin_lock_irqsave(&ac10x->lock, flags);
+		/*
+		 * No spin_lock: these are sleeping regmap-I2C writes that MUST run in
+		 * process context. nonatomic .trigger is serialised by the PCM action
+		 * mutex; the old spin_lock_irqsave() only created an illegal
+		 * sleep-in-atomic window (an I2C xfer dwarfs any scheduling gap it
+		 * tried to close).
+		 */
 		if (ac10x->aif1_clken == 0){
 			/*
 			 * enable aif1clk, it' here due to reduce time between 'AC108 Sysclk Enable' and 'AC101 Sysclk Enable'
@@ -1279,7 +1311,6 @@ int ac101_trigger(struct snd_pcm_substream *substream, int cmd,
 			ret = ret || ac101_update_bits(codec, MOD_CLK_ENA, (0x1<<MOD_CLK_AIF1), (0x1<<MOD_CLK_AIF1));
 			ret = ret || ac101_update_bits(codec, MOD_RST_CTRL, (0x1<<MOD_RESET_AIF1), (0x1<<MOD_RESET_AIF1));
 		}
-		spin_unlock_irqrestore(&ac10x->lock, flags);
 		#endif
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -1447,9 +1478,14 @@ int ac101_codec_probe(struct snd_soc_codec *codec)
 /* power down chip */
 int ac101_codec_remove(struct snd_soc_codec *codec)
 {
-	#ifdef CONFIG_AC101_SWITCH_DETECT
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
 
+	/* teardown-ordering: stop the playback delayed work and the resume work
+	 * before the codec context is torn down (both dereference the codec). */
+	cancel_delayed_work_sync(&ac10x->dlywork);
+	cancel_work_sync(&ac10x->codec_resume);
+
+	#ifdef CONFIG_AC101_SWITCH_DETECT
 	if (ac10x->irq) {
 		devm_free_irq(codec->dev, ac10x->irq, ac10x);
 		ac10x->irq = 0;
@@ -1510,11 +1546,15 @@ static ssize_t ac101_debug_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct ac10x_priv *ac10x = dev_get_drvdata(dev);
-	int val = 0, flag = 0;
+	u32 val = 0;
+	int flag = 0;
 	u16 value_w, value_r;
 	u8 reg, num, i=0;
 
-	val = simple_strtol(buf, NULL, 16);
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+	if (kstrtou32(buf, 16, &val))
+		return -EINVAL;
 	flag = (val >> 24) & 0xF;
 	if (flag) {
 		reg = (val >> 16) & 0xFF;
@@ -1585,7 +1625,7 @@ int ac10x_fill_regcache(struct device* dev, struct regmap* map) {
 	int v;
 
 	n = regmap_get_max_register(map);
-	for (i = 0; i < n; i++) {
+	for (i = 0; i <= n; i++) {	/* <= : include max_register in the cache */
 		regcache_cache_bypass(map, true);
 		r = regmap_read(map, i, &v);
 		if (r) {
@@ -1690,6 +1730,8 @@ void ac101_shutdown(struct i2c_client *i2c)
 
 int ac101_remove(struct i2c_client *i2c)
 {
+	/* drop the playback clock callback before the ac10x context is freed */
+	seeed_voice_card_register_set_clock(SNDRV_PCM_STREAM_PLAYBACK, NULL);
 	sysfs_remove_group(&i2c->dev.kobj, &audio_debug_attr_group);
 	return 0;
 }

@@ -1377,7 +1377,11 @@ static int wm8960_i2c_probe(struct i2c_client *i2c)
 
 	i2c_set_clientdata(i2c, wm8960);
 
-	ret = snd_soc_register_codec(&i2c->dev,
+	/* NON-devm to match the non-devm snd_soc_unregister_component() in
+	 * wm8960_i2c_remove(); the sound-compatible shim aliases
+	 * snd_soc_register_codec -> devm_snd_soc_register_component, which would
+	 * double-unregister (devm auto + manual) and tear down after free. */
+	ret = snd_soc_register_component(&i2c->dev,
 			&soc_codec_dev_wm8960, &wm8960_dai, 1);
 
 	return ret;

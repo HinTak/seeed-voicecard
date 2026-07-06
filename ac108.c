@@ -219,6 +219,9 @@ static int snd_ac108_get_volsw(struct snd_kcontrol *kcontrol,
 	int ret, chip = mc->autodisable;
 	u8 val;
 
+	if (chip < 0 || chip >= ac10x->codec_cnt || !ac10x->i2cmap[chip])
+		return -EINVAL;
+
 	if ((ret = ac10x_read(mc->reg, &val, ac10x->i2cmap[chip])) < 0)
 		return ret;
 
@@ -249,6 +252,12 @@ static int snd_ac108_put_volsw(struct snd_kcontrol *kcontrol,
 	unsigned int val, mask = (1 << fls(mc->max)) - 1;
 	unsigned int invert = mc->invert;
 	int ret, chip = mc->autodisable;
+
+	if (chip < 0 || chip >= ac10x->codec_cnt || !ac10x->i2cmap[chip])
+		return -EINVAL;
+	if (ucontrol->value.integer.value[0] < 0 ||
+	    ucontrol->value.integer.value[0] > mc->max)
+		return -EINVAL;
 
 	if (sign_bit)
 		mask = BIT(sign_bit + 1) - 1;
@@ -463,7 +472,7 @@ static int ac108_multi_update_bits(u8 reg, u8 mask, u8 val, struct ac10x_priv *a
 }
 
 static unsigned int ac108_codec_read(struct snd_soc_codec *codec, unsigned int reg) {
-	unsigned char val_r;
+	unsigned char val_r = 0;	/* ac10x_read leaves this untouched on I2C error */
 	struct ac10x_priv *ac10x = dev_get_drvdata(codec->dev);
 	/*read one chip is fine*/
 	ac10x_read(reg, &val_r, ac10x->i2cmap[_MASTER_INDEX]);
@@ -543,6 +552,11 @@ static int ac108_config_pll(struct ac10x_priv *ac10x, unsigned rate, unsigned lr
 								ac108_pll_div.freq_in, ac108_pll_div.freq_out);
 				break;
 			}
+		}
+		if (i >= ARRAY_SIZE(ac108_pll_div_list)) {
+			dev_err(&ac10x->i2c[_MASTER_INDEX]->dev,
+				"AC108 no PLL divider for freq_in=%u rate=%u\n", pll_freq_in, rate);
+			return -EINVAL;
 		}
 		/* 0x11,0x12,0x13,0x14: Config PLL DIV param M1/M2/N/K1/K2 */
 		ac108_multi_update_bits(PLL_CTRL5, 0x1f << PLL_POSTDIV1 | 0x01 << PLL_POSTDIV2,
@@ -995,6 +1009,13 @@ static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substre
 	u8 reg;
 	int ret = 0;
 
+	/*
+	 * Runs sleeping regmap-I2C (and, on START, ac101_trigger's I2C). Must be
+	 * process context -- the machine .trigger is nonatomic. Assert it so any
+	 * regression back into atomic context is caught immediately.
+	 */
+	might_sleep();
+
 	dev_dbg(ac10x->codec->dev, "%s() L%d cmd:%d\n", __func__, __LINE__, y_start_n_stop);
 
 	/* spin_lock move to machine trigger */
@@ -1052,9 +1073,16 @@ static int ac108_trigger(struct snd_pcm_substream *substream, int cmd,
 {
 	struct snd_soc_codec *codec = dai->codec;
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
-	unsigned long flags;
 	int ret = 0;
 	u8 r;
+
+	/*
+	 * Assert process context: the START case does sleeping regmap-I2C.
+	 * dai_link is nonatomic so this runs in process context; might_sleep()
+	 * turns any future atomic-context regression into a loud warning
+	 * instead of a silent sleep-in-atomic panic.
+	 */
+	might_sleep();
 
 	dev_dbg(dai->dev, "%s() stream=%s  cmd=%d\n",
 		__FUNCTION__,
@@ -1065,14 +1093,18 @@ static int ac108_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		spin_lock_irqsave(&ac10x->lock, flags);
+		/*
+		 * No spin_lock: ac10x_read()/ac108_multi_update_bits() are sleeping
+		 * I2C and MUST run in process context. nonatomic .trigger is serialised
+		 * by the PCM action mutex; the old spin_lock_irqsave() only created an
+		 * illegal sleep-in-atomic window.
+		 */
 		/* disable global clock if lrck disabled */
 		ac10x_read(I2S_CTRL, &r, ac10x->i2cmap[_MASTER_INDEX]);
 		if ((r & (0x01 << BCLK_IOEN)) && (r & (0x01 << LRCK_IOEN)) == 0) {
 			/* disable global clock */
 			ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x0 << TXEN | 0x0 << GEN, ac10x);
 		}
-		spin_unlock_irqrestore(&ac10x->lock, flags);
 
 		/* delayed clock starting, move to machine trigger() */
 		break;
@@ -1333,10 +1365,14 @@ static struct snd_soc_codec_driver ac10x_soc_codec_driver = {
 };
 
 static ssize_t ac108_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-	int val = 0, flag = 0;
+	u32 val = 0;
+	int flag = 0;
 	u8 i = 0, reg, num, value_w, value_r[4];
 
-	val = simple_strtol(buf, NULL, 16);
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+	if (kstrtou32(buf, 16, &val))
+		return -EINVAL;
 	flag = (val >> 16) & 0xF;
 
 	if (flag) {
@@ -1349,6 +1385,8 @@ static ssize_t ac108_store(struct device *dev, struct device_attribute *attr, co
 
 		reg = (val >> 8) & 0xFF;
 		num = val & 0xff;
+		if (num > 0x80)
+			num = 0x80;
 		printk("\nRead: start REG:0x%02x,count:0x%02x\n", reg, num);
 
 		for (k = 0; k < ac10x->codec_cnt; k++) {
@@ -1492,7 +1530,20 @@ __ret:
 		if (! ac10x->i2c101) {
 			memset(&ac108_dai[_MASTER_INDEX]->playback, '\0', sizeof ac108_dai[_MASTER_INDEX]->playback);
 		}
-		ret = snd_soc_register_codec(&ac10x->i2c[_MASTER_INDEX]->dev, &ac10x_soc_codec_driver,
+		/*
+		 * NON-devm registration to stay symmetric with the explicit
+		 * snd_soc_unregister_component() + kfree(ac10x) in ac108_i2c_remove().
+		 * The sound-compatible shim maps snd_soc_register_codec ->
+		 * devm_snd_soc_register_component; mixing that with the manual
+		 * unregister double-tears-down the codec and lets devm run codec
+		 * teardown (which dereferences the global ac10x) AFTER kfree(ac10x)
+		 * -> UAF on module unbind / shutdown. Match register to unregister.
+		 */
+		if (!ac10x->i2c[_MASTER_INDEX]) {
+			dev_err(&i2c->dev, "master AC108 (index %d) not probed; cannot register codec\n", _MASTER_INDEX);
+			return -ENODEV;
+		}
+		ret = snd_soc_register_component(&ac10x->i2c[_MASTER_INDEX]->dev, &ac10x_soc_codec_driver,
 						ac108_dai[_MASTER_INDEX], 1);
 		if (ret < 0) {
 			dev_err(&i2c->dev, "Failed to register ac10x codec: %d\n", ret);
@@ -1523,6 +1574,9 @@ static void ac108_i2c_remove(struct i2c_client *i2c) {
 
 __ret:
 	if (!ac10x->i2c[0] && !ac10x->i2c[1] && !ac10x->i2c101) {
+		/* drop stale clock callbacks before freeing the context they deref */
+		seeed_voice_card_register_set_clock(SNDRV_PCM_STREAM_CAPTURE, NULL);
+		seeed_voice_card_register_set_clock(SNDRV_PCM_STREAM_PLAYBACK, NULL);
 		kfree(ac10x);
 		ac10x = NULL;
 	}
