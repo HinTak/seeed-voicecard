@@ -1170,7 +1170,7 @@ int ac101_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	reg_val = ac101_read(codec, AIF_CLK_CTRL);
 	reg_val &= ~(0x1<<AIF1_MSTR_MOD);
 	switch(fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:   /* codec clk & frm master, ap is slave*/
+	case SND_SOC_DAIFMT_CBP_CFP:   /* codec clk & frm master, ap is slave*/
 		#if _MASTER_MULTI_CODEC == _MASTER_AC101
 		pr_info("AC101 as Master\n");
 		reg_val |= (0x0<<AIF1_MSTR_MOD);
@@ -1178,7 +1178,7 @@ int ac101_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		#else
 		pr_info("AC108 as Master\n");
 		#endif
-	case SND_SOC_DAIFMT_CBS_CFS:   /* codec clk & frm slave, ap is master*/
+	case SND_SOC_DAIFMT_CBC_CFC:   /* codec clk & frm slave, ap is master*/
 		pr_info("AC101 as Slave\n");
 		reg_val |= (0x1<<AIF1_MSTR_MOD);
 		break;

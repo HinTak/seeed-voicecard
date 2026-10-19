@@ -586,8 +586,7 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	if (ret < 0)
 		goto dai_link_of_err;
 
-	ret = simple_util_set_dailink_name(dev, dai_link,
-						"%s-%s",
+	dai_link->name = devm_kasprintf(dev, GFP_KERNEL, "%s-%s",
 						dai_link->cpus->dai_name,
 						#if _SINGLE_CODEC
 						dai_link->codecs->dai_name
@@ -595,8 +594,11 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 						dai_link->codecs[0].dai_name
 						#endif
 	);
-	if (ret < 0)
+	if (!dai_link->name) {
+		ret = -ENOMEM;
 		goto dai_link_of_err;
+	}
+	dai_link->stream_name = dai_link->name;
 
 	dai_link->ops = &seeed_voice_card_ops;
 	dai_link->init = seeed_voice_card_dai_init;
@@ -717,9 +719,11 @@ static int seeed_voice_card_parse_of(struct device_node *node,
 			goto card_parse_end;
 	}
 
-	ret = simple_util_parse_card_name(&priv->snd_card, PREFIX);
-	if (ret < 0)
+	ret = snd_soc_of_parse_card_name(&priv->snd_card, PREFIX "name");
+	if (ret < 0) {
+		dev_err(dev, "Failed to parse name");
 		goto card_parse_end;
+	}
 
 	ret = seeed_voice_card_parse_aux_devs(node, priv);
 

@@ -281,7 +281,7 @@ static int snd_ac108_put_volsw(struct snd_kcontrol *kcontrol,
 	.tlv.p = (tlv_array), \
 	.info = snd_soc_info_volsw, .get = snd_ac108_get_volsw,\
 	.put = snd_ac108_put_volsw, \
-	.private_value = SOC_SINGLE_VALUE(reg, shift, max, invert, chip) }
+	.private_value = SOC_SINGLE_VALUE(reg, shift, 0, max, invert, chip) }
 
 /* single ac108 */
 static const struct snd_kcontrol_new ac108_snd_controls[] = {
@@ -867,7 +867,7 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 	dev_dbg(dai->dev, "%s\n", __FUNCTION__);
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:    /*AC108 Master*/
+	case SND_SOC_DAIFMT_CBP_CFP:    /*AC108 Master*/
 		if (! ac10x->i2c101 || _MASTER_MULTI_CODEC == _MASTER_AC108) {
 			dev_dbg(dai->dev, "AC108 set to work as Master\n");
 			/**
@@ -883,7 +883,7 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 			dev_dbg(dai->dev, "used as slave when AC101 is master\n");
 		}
 		fallthrough;
-	case SND_SOC_DAIFMT_CBS_CFS:    /*AC108 Slave*/
+	case SND_SOC_DAIFMT_CBC_CFC:    /*AC108 Slave*/
 		dev_dbg(dai->dev, "AC108 set to work as Slave\n");
 		/**
 		 * 0x30:chip is slave mode, BCLK & LRCK input,enable SDO1_EN and 
