@@ -913,7 +913,14 @@ int ac101_aif_mute(struct snd_soc_dai *codec_dai, int mute)
 
 	AC101_DBG("mute=%d\n",  mute);
 
-	ac101_write(codec, DAC_VOL_CTRL, mute? 0: 0xA0A0);
+	/*
+	 * Do NOT clobber DAC_VOL_CTRL here. DAC_VOL_CTRL is *also* the
+	 * ALSA "DAC volume" mixer control, so writing 0 on mute (and a hardcoded
+	 * 0xA0A0 on unmute) overrode the user/alsactl setting and, worse, zeroed the
+	 * volume on EVERY stream close -> all playback after the first was silent.
+	 * Muting is already done by disabling the speaker (SPKOUT_CTRL) and gating
+	 * the amp in the mute branch below; the DAC level is left to the ALSA control.
+	 */
 
 	if (!mute) {
 		#if _MASTER_MULTI_CODEC != _MASTER_AC101
@@ -1419,7 +1426,14 @@ int ac101_codec_probe(struct snd_soc_codec *codec)
 
 	/*enable this bit to prevent leakage from ldoin*/
 	ac101_update_bits(codec, ADDA_TUNE3, (0x1<<OSCEN), (0x1<<OSCEN));
-	ac101_write(codec, DAC_VOL_CTRL, 0);
+	/*
+	 * Probe with an AUDIBLE DAC volume (0xA0A0 ~= 0 dB), NOT 0 (-119 dB).
+	 * We removed the 0xA0A0-on-unmute write in ac101_aif_mute (it clobbered the ALSA
+	 * "DAC volume" control every stream-close), so this probe write is now the initial
+	 * value the control mirrors. Leaving it at 0 would silence playback out-of-the-box
+	 * on any image without a saved alsactl asound.state. alsactl restore still overrides.
+	 */
+	ac101_write(codec, DAC_VOL_CTRL, 0xA0A0);
 
 	/* customized get/put inteface */
 	for (ret = 0; ret < ARRAY_SIZE(ac101_controls); ret++) {
