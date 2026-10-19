@@ -73,6 +73,11 @@ struct seeed_card_data {
 	struct work_struct work_codec_clk;
 	#define TRY_STOP_MAX	3
 	int try_stop;
+	/* deferred-clock context: .trigger may run atomic, so the sleeping codec
+	 * I2C clock enable/disable is pushed to work_codec_clk (process context). */
+	struct snd_soc_dai *clk_dai;
+	int clk_start;			/* 1 = enable (START), 0 = disable (STOP) */
+	int ch_refcnt;			/* opens holding the CPU-DAI channel override */
 };
 
 struct seeed_card_info {
@@ -95,6 +100,11 @@ struct seeed_card_info {
 #define CELL	"#sound-dai-cells"
 #define PREFIX	"seeed-voice-card,"
 
+/* Serialises the CPU-DAI channel-range override across concurrent / full-duplex
+ * opens so the save/restore can't corrupt the advertised range. The override is
+ * LOAD-BEARING: it expands the bcm2835-i2s CPU DAI to the TDM channel count. */
+static DEFINE_MUTEX(seeed_ch_lock);
+
 static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
@@ -111,16 +121,27 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	if (ret)
 		clk_disable_unprepare(dai_props->cpu_dai.clk);
 
-	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min) {
-		priv->channels_playback_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min;
+	/*
+	 * Expand the CPU-DAI (bcm2835-i2s) advertised channel range to the TDM
+	 * override. This is LOAD-BEARING: without it 8ch TDM capture fails
+	 * hw_params with -EINVAL (the I2S DAI natively caps at 2ch). Done under a
+	 * mutex + refcount so concurrent / full-duplex opens cannot corrupt the
+	 * saved defaults -- only the first open saves+applies, the last restores.
+	 */
+	mutex_lock(&seeed_ch_lock);
+	if (priv->ch_refcnt++ == 0) {
+		if (snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min) {
+			priv->channels_playback_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min;
+		}
+		if (snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min) {
+			priv->channels_capture_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min;
+		}
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_override;
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_override;
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_override;
 	}
-	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min) {
-		priv->channels_capture_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min;
-	}
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_override;
+	mutex_unlock(&seeed_ch_lock);
 
 	return ret;
 }
@@ -132,10 +153,16 @@ static void seeed_voice_card_shutdown(struct snd_pcm_substream *substream)
 	struct seeed_dai_props *dai_props =
 		seeed_priv_to_props(priv, rtd->id);
 
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_default;
+	/* Restore the CPU-DAI channel range when the last open goes away
+	 * (locked + refcounted mirror of the startup override). */
+	mutex_lock(&seeed_ch_lock);
+	if (priv->ch_refcnt > 0 && --priv->ch_refcnt == 0) {
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_default;
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_default;
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_default;
+		snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_default;
+	}
+	mutex_unlock(&seeed_ch_lock);
 
 	clk_disable_unprepare(dai_props->cpu_dai.clk);
 
@@ -180,9 +207,12 @@ err:
 static int (* _set_clock[_SET_CLOCK_CNT])(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai);
 
 int seeed_voice_card_register_set_clock(int stream, int (*set_clock)(int, struct snd_pcm_substream *, int, struct snd_soc_dai *)) {
-	if (! _set_clock[stream]) {
-		_set_clock[stream] = set_clock;
-	}
+	if (stream < 0 || stream >= _SET_CLOCK_CNT)
+		return -EINVAL;
+	/* Unconditional: lets a re-probe refresh the pointer AND a remove clear it
+	 * (NULL). The old `if (!_set_clock[stream])` guard left a stale callback
+	 * after unbind -> NULL-deref when .trigger next fired. */
+	_set_clock[stream] = set_clock;
 	return 0;
 }
 EXPORT_SYMBOL(seeed_voice_card_register_set_clock);
@@ -195,12 +225,26 @@ static void work_cb_codec_clk(struct work_struct *work)
 	struct seeed_card_data *priv = container_of(work, struct seeed_card_data, work_codec_clk);
 	int r = 0;
 
-	if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) {
-		r = r || _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
+	/*
+	 * Runs in process context (workqueue), so the codec clock I2C below may
+	 * sleep safely -- this is the whole point of deferring it out of the
+	 * (possibly atomic) PCM .trigger.
+	 */
+	if (priv->clk_start) {
+		/* deferred START: enable codec clocks */
+		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE])
+			_set_clock[SNDRV_PCM_STREAM_CAPTURE](1, NULL, SNDRV_PCM_TRIGGER_START, priv->clk_dai);
+		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK])
+			_set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, NULL, SNDRV_PCM_TRIGGER_START, priv->clk_dai);
+		return;
 	}
-	if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) {
-		r = r || _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-	}
+
+	/* deferred STOP: disable codec clocks. Use |= (not ||) so a nonzero result
+	 * from the first stream can't short-circuit the second stream's stop. */
+	if (_set_clock[SNDRV_PCM_STREAM_CAPTURE])
+		r |= _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL);
+	if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK])
+		r |= _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL);
 
 	if (r && priv->try_stop++ < TRY_STOP_MAX) {
 		if (0 != schedule_work(&priv->work_codec_clk)) {}
@@ -226,16 +270,17 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		if (cancel_work_sync(&priv->work_codec_clk) != 0) {}
-		#if CONFIG_AC10X_TRIG_LOCK
-		/* I know it will degrades performance, but I have no choice */
-		spin_lock_irqsave(&priv->lock, flags);
-		#endif
-		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
-		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, substream, cmd, dai);
-		#if CONFIG_AC10X_TRIG_LOCK
-		spin_unlock_irqrestore(&priv->lock, flags);
-		#endif
+		/*
+		 * Enabling the codec clocks does sleeping I2C. ASoC may call
+		 * .trigger in atomic context (IRQs disabled by the PCM stream lock;
+		 * the dai_link 'nonatomic' hint is unreliable on this card/kernel),
+		 * so defer the clock enable to work_codec_clk (process context).
+		 * cancel_work() (not _sync) is safe in atomic context.
+		 */
+		cancel_work(&priv->work_codec_clk);
+		priv->clk_dai = dai;
+		priv->clk_start = 1;
+		if (0 != schedule_work(&priv->work_codec_clk)) {}
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -246,15 +291,14 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 			break;
 		}
 
-		/* interrupt environment */
-		if (in_irq() || in_nmi() || in_serving_softirq()) {
-			priv->try_stop = 0;
-			if (0 != schedule_work(&priv->work_codec_clk)) {
-			}
-		} else {
-			if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-			if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-		}
+		/*
+		 * Disabling the codec clocks also sleeps (I2C); always defer to the
+		 * workqueue so it never runs in the atomic .trigger context.
+		 */
+		cancel_work(&priv->work_codec_clk);
+		priv->clk_start = 0;
+		priv->try_stop = 0;
+		if (0 != schedule_work(&priv->work_codec_clk)) {}
 		break;
 	default:
 		ret = -EINVAL;
@@ -312,8 +356,10 @@ static int simple_util_parse_dai(struct device_node *node,
 	 *    if he unbinded CPU or Codec.
 	 */
 	ret = snd_soc_of_get_dai_name(node, &dlc->dai_name, 0);
-	if (ret < 0)
+	if (ret < 0) {
+		of_node_put(args.np);
 		return ret;
+	}
 
 	dlc->of_node = args.np;
 
@@ -582,6 +628,7 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 
 dai_link_of_err:
 	of_node_put(cpu);
+	of_node_put(plat);
 	of_node_put(codec);
 
 	return ret;
@@ -777,11 +824,17 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	int num, ret, i;
 
-	/* Get the number of DAI links */
-	if (np && of_get_child_by_name(np, PREFIX "dai-link"))
-		num = of_get_child_count(np);
-	else
-		num = 1;
+	/* Get the number of DAI links (release the looked-up node) */
+	{
+		struct device_node *dl = np ? of_get_child_by_name(np, PREFIX "dai-link") : NULL;
+
+		if (dl) {
+			num = of_get_child_count(np);
+			of_node_put(dl);
+		} else {
+			num = 1;
+		}
+	}
 
 	/* Allocate the private data and the DAI link array */
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
@@ -810,6 +863,7 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 		dai_link[i].num_codecs		= 1;
 		dai_link[i].platforms		= &dai_props[i].platforms;
 		dai_link[i].num_platforms	= 1;
+		dai_link[i].nonatomic		= 1;	/* .trigger in process ctx: fixes sleeping-I2C-in-atomic panic */
 	}
 
 	priv->dai_props			= dai_props;
